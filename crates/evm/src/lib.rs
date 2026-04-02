@@ -119,6 +119,10 @@ pub struct Evm<C: sov_modules_api::Context> {
     #[state(rename = "S")]
     pub cfg: sov_modules_api::StateValue<EvmChainConfig, BcsCodec>,
 
+    /// Genesis account allocation snapshot retained for RPC-only genesis tracing.
+    #[state(rename = "G")]
+    pub(crate) genesis_accounts: sov_modules_api::StateValue<Vec<AccountData>, BcsCodec>,
+
     /// Block environment used by the evm. This field is set in `begin_slot_hook`.
     /// WARNING: only use in the L2 block hook & tx execution path.
     /// And not in any place such as functions that might be called from RPC etc.
