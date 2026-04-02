@@ -205,7 +205,6 @@ impl<C: sov_modules_api::Context> Evm<C> {
             base_fee_params: config.base_fee_params,
         };
 
-        self.genesis_accounts.set(&config.data, working_set);
         self.cfg.set(&chain_cfg, working_set);
 
         let evm_spec = citrea_spec_id_to_evm_spec_id(citrea_spec.spec_id);

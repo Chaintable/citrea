@@ -58,7 +58,6 @@ pub struct IndexValuePair {
     pub value: U256,
 }
 
-
 impl From<&[AccountData]> for BlockStorageDiff {
     fn from(accounts: &[AccountData]) -> Self {
         let mut new_accounts = Vec::new();
@@ -610,7 +609,6 @@ pub fn get_storage_contracts_from_genesis(accounts: &[AccountData]) -> Vec<Addre
         })
         .collect()
 }
-
 
 pub(crate) fn get_storage_diffs_from_changes<C: sov_modules_api::Context>(
     db: &mut EvmDb<'_, C>,
