@@ -54,8 +54,8 @@ use crate::call::get_cfg_env;
 use crate::conversions::{create_tx_env, sealed_block_to_block_env};
 use crate::debank::{
     account_changeset_from_state, build_debank_traces, get_storage_contracts_from_changes,
-    get_storage_diffs_from_changes, header_from_sealed_block, BlockFile, BlockStorageDiffBuilder,
-    DebankBlock, DebankOutPut, DebankTransaction,
+    get_storage_contracts_from_genesis, get_storage_diffs_from_changes, header_from_sealed_block,
+    BlockFile, BlockStorageDiffBuilder, DebankBlock, DebankOutPut, DebankTransaction,
 };
 use crate::evm::call::{create_txn_env, prepare_call_env};
 use crate::evm::db::EvmDb;
@@ -64,7 +64,7 @@ use crate::evm::primitive_types::{
 };
 use crate::handler::{diff_size_send_eth_eoa, TxInfo};
 use crate::rpc_helpers::*;
-use crate::{citrea_spec_id_to_evm_spec_id, Evm, EvmChainConfig};
+use crate::{citrea_spec_id_to_evm_spec_id, BlockStorageDiff, Evm, EvmChainConfig};
 /// Gas per transaction not creating a contract.
 pub const MIN_TRANSACTION_GAS: u64 = 21_000u64;
 
@@ -1557,24 +1557,31 @@ impl<C: sov_modules_api::Context> Evm<C> {
             ..Default::default()
         };
         let header = header_from_sealed_block(&block);
+        if block_number == 0 {
+            let genesis_accounts = self.genesis_accounts.get(working_set).unwrap_or_default();
+            let mut state_diff = BlockStorageDiff::from(genesis_accounts.as_slice());
+            state_diff.hash = block.header.hash();
+            block_file.storage_contracts = get_storage_contracts_from_genesis(&genesis_accounts);
+            let validation_hash = block_file.validation().validation_hash;
+            return Ok(DebankOutPut {
+                block_file,
+                header,
+                state_diff: alloy_rlp::encode(state_diff).into(),
+                validation_hash,
+            });
+        }
 
-        let parent_state_root = if block_number == 0 {
-            B256::ZERO
-        } else {
-            self.get_sealed_block_by_number(
+        let parent_state_root = self
+            .get_sealed_block_by_number(
                 Some(BlockNumberOrTag::Number(block_number - 1)),
                 working_set,
                 ledger_db,
             )?
             .ok_or_else(|| EthApiError::HeaderNotFound((block_number - 1).into()))?
             .header
-            .state_root
-        };
+            .state_root;
 
-        if block_number == 0
-            || transactions.is_empty()
-            || parent_state_root == block.header.state_root
-        {
+        if parent_state_root == block.header.state_root {
             let state_diff = BlockStorageDiffBuilder::default()
                 .build(block.header.state_root, parent_state_root);
             let validation_hash = block_file.validation().validation_hash;

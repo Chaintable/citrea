@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use alloy_consensus::constants::KECCAK_EMPTY;
+use alloy_consensus::constants::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
 use alloy_consensus::{Transaction, TxReceipt};
 use alloy_primitives::{hex, keccak256, Address, BlockHash, BlockNumber, Bytes, B256, U256};
 use alloy_rlp::{RlpDecodable, RlpEncodable};
@@ -20,6 +20,7 @@ use crate::evm::db::EvmDb;
 use crate::evm::primitive_types::{
     CitreaReceiptWithBloom, SealedBlock, TransactionSignedAndRecovered,
 };
+use crate::AccountData;
 
 #[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable, Default)]
 pub struct BlockStorageDiff {
@@ -55,6 +56,55 @@ pub struct AccountStorageDiff {
 pub struct IndexValuePair {
     pub index: B256,
     pub value: U256,
+}
+
+
+impl From<&[AccountData]> for BlockStorageDiff {
+    fn from(accounts: &[AccountData]) -> Self {
+        let mut new_accounts = Vec::new();
+        let mut new_codes = Vec::new();
+        let mut storage_diffs = Vec::new();
+
+        for account in accounts {
+            new_accounts.push(NewAccount {
+                address: keccak256(account.address.0),
+                balance: account.balance,
+                nonce: account.nonce,
+                code_hash: account.code_hash,
+            });
+
+            if !account.code.is_empty() {
+                new_codes.push(NewCode {
+                    code_hash: account.code_hash,
+                    code: account.code.clone(),
+                });
+            }
+
+            if !account.storage.is_empty() {
+                let diffs = account
+                    .storage
+                    .iter()
+                    .map(|(key, value)| IndexValuePair {
+                        index: keccak256::<[u8; 32]>(key.to_be_bytes()),
+                        value: *value,
+                    })
+                    .collect();
+                storage_diffs.push(AccountStorageDiff {
+                    address: keccak256(account.address.0),
+                    diffs,
+                });
+            }
+        }
+
+        BlockStorageDiff {
+            hash: B256::ZERO,
+            parent_hash: EMPTY_ROOT_HASH,
+            new_accounts,
+            deleted_accounts: vec![],
+            storage_diffs,
+            new_codes,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -547,6 +597,20 @@ pub fn get_storage_contracts_from_changes(changes: &[(Address, Account)]) -> Vec
         })
         .collect()
 }
+
+pub fn get_storage_contracts_from_genesis(accounts: &[AccountData]) -> Vec<Address> {
+    accounts
+        .iter()
+        .filter_map(|account| {
+            if account.storage.is_empty() {
+                None
+            } else {
+                Some(account.address)
+            }
+        })
+        .collect()
+}
+
 
 pub(crate) fn get_storage_diffs_from_changes<C: sov_modules_api::Context>(
     db: &mut EvmDb<'_, C>,
