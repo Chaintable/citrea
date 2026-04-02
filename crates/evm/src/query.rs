@@ -34,13 +34,14 @@ use reth_rpc_eth_types::error::{
     ensure_success, EthApiError, EthResult, RevertError, RpcInvalidTransactionError,
 };
 use reth_rpc_eth_types::logs_utils::log_matches_filter;
+use revm::bytecode::opcode::OpCode;
 use revm::context::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction};
 use revm::context::{BlockEnv, Cfg, CfgEnv, TransactTo};
 use revm::context_interface::block::BlobExcessGasAndPrice;
 use revm::primitives::hardfork::SpecId;
 use revm::{Database, DatabaseCommit};
 use revm_inspectors::access_list::AccessListInspector;
-use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
+use revm_inspectors::tracing::{OpcodeFilter, TracingInspector, TracingInspectorConfig};
 use serde::{Deserialize, Serialize};
 use sov_db::ledger_db::NodeLedgerOps;
 use sov_db::schema::types::L2HeightStatus;
@@ -51,6 +52,11 @@ use sov_modules_api::{SpecId as CitreaSpecId, WorkingSet};
 
 use crate::call::get_cfg_env;
 use crate::conversions::{create_tx_env, sealed_block_to_block_env};
+use crate::debank::{
+    account_changeset_from_state, build_debank_traces, get_storage_contracts_from_changes,
+    get_storage_diffs_from_changes, header_from_sealed_block, BlockFile, BlockStorageDiffBuilder,
+    DebankBlock, DebankOutPut, DebankTransaction,
+};
 use crate::evm::call::{create_txn_env, prepare_call_env};
 use crate::evm::db::EvmDb;
 use crate::evm::primitive_types::{
@@ -1490,6 +1496,165 @@ impl<C: sov_modules_api::Context> Evm<C> {
             }
         }
         Ok(traces)
+    }
+
+    /// Traces a block and returns Debank-formatted header, state diff, and logs.
+    pub fn trace_debank_block(
+        &self,
+        block_id: BlockId,
+        working_set: &mut WorkingSet<C::Storage>,
+        ledger_db: &crate::LedgerDB,
+        fork_fn: impl Fn(u64) -> Fork,
+    ) -> RpcResult<DebankOutPut> {
+        let block_number = match block_id {
+            BlockId::Number(BlockNumberOrTag::Pending) => {
+                return Err(EthApiError::Unsupported(
+                    "pending block not supported for trace_debankBlock",
+                )
+                .into());
+            }
+            _ => self.block_number_from_state(Some(block_id), working_set, ledger_db)?,
+        };
+
+        let block = self
+            .get_sealed_block_by_number(
+                Some(BlockNumberOrTag::Number(block_number)),
+                working_set,
+                ledger_db,
+            )?
+            .ok_or_else(|| EthApiError::HeaderNotFound(block_id))?;
+
+        let tx_range = block.transactions.clone();
+        let transactions: Vec<TransactionSignedAndRecovered> = tx_range
+            .clone()
+            .map(|id| {
+                self.transactions
+                    .get(id as usize, &mut working_set.accessory_state())
+                    .expect("Transaction must be set")
+            })
+            .collect();
+        let receipts: Vec<CitreaReceiptWithBloom> = tx_range
+            .clone()
+            .map(|id| {
+                self.receipts
+                    .get(id as usize, &mut working_set.accessory_state())
+                    .expect("Receipt must be set")
+            })
+            .collect();
+
+        let debank_transactions = transactions
+            .iter()
+            .zip(receipts.iter())
+            .enumerate()
+            .map(|(index, (tx, receipt))| {
+                DebankTransaction::from_parts(receipt, tx, &block, index as u64)
+            })
+            .collect::<Vec<_>>();
+
+        let mut block_file = BlockFile {
+            block: DebankBlock::from(&block),
+            transactions: debank_transactions,
+            ..Default::default()
+        };
+        let header = header_from_sealed_block(&block);
+
+        let parent_state_root = if block_number == 0 {
+            B256::ZERO
+        } else {
+            self.get_sealed_block_by_number(
+                Some(BlockNumberOrTag::Number(block_number - 1)),
+                working_set,
+                ledger_db,
+            )?
+            .ok_or_else(|| EthApiError::HeaderNotFound((block_number - 1).into()))?
+            .header
+            .state_root
+        };
+
+        if block_number == 0
+            || transactions.is_empty()
+            || parent_state_root == block.header.state_root
+        {
+            let state_diff = BlockStorageDiffBuilder::default()
+                .build(block.header.state_root, parent_state_root);
+            let validation_hash = block_file.validation().validation_hash;
+            return Ok(DebankOutPut {
+                block_file,
+                header,
+                state_diff: alloy_rlp::encode(state_diff).into(),
+                validation_hash,
+            });
+        }
+
+        set_state_to_end_of_evm_block::<C>(block_number - 1, working_set);
+
+        let citrea_spec_id = fork_fn(block_number).spec_id;
+        let evm_spec_id = citrea_spec_id_to_evm_spec_id(citrea_spec_id);
+        let cfg = self
+            .cfg
+            .get(working_set)
+            .expect("EVM chain config should be set");
+        let cfg_env = get_cfg_env(cfg, evm_spec_id);
+        let block_env = sealed_block_to_block_env(&block.header);
+        let l1_fee_rate = block.l1_fee_rate;
+        let mut evm_db = self.get_db(working_set, citrea_spec_id);
+        let log_index = std::cell::RefCell::new(0usize);
+        let mut state_diff_builder = BlockStorageDiffBuilder::default();
+        let mut storage_contracts = std::collections::BTreeSet::new();
+
+        for (index, tx) in transactions.iter().enumerate() {
+            let mut inspector = TracingInspector::new(
+                TracingInspectorConfig::default_parity()
+                    .set_steps(true)
+                    .set_record_logs(true)
+                    .set_exclude_precompile_calls(false),
+            );
+            inspector.config_mut().record_opcodes_filter =
+                Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
+
+            let recovered_tx: Recovered<TransactionSigned> = tx.clone().into();
+            let result = trace_citrea(
+                &mut evm_db,
+                cfg_env.clone(),
+                block_env.clone(),
+                create_tx_env(&recovered_tx),
+                Some(tx.signed_transaction.hash()),
+                l1_fee_rate,
+                &mut inspector,
+            )
+            .map_err(|e| EthApiError::EvmCustom(e.to_string()))?;
+
+            let changes = account_changeset_from_state(&result.state);
+            for address in get_storage_contracts_from_changes(&changes) {
+                storage_contracts.insert(address);
+            }
+            state_diff_builder.merge(get_storage_diffs_from_changes(&mut evm_db, &changes));
+
+            let (traces, error_traces, events, error_events) = build_debank_traces(
+                *tx.signed_transaction.hash(),
+                inspector.into_traces(),
+                &log_index,
+            );
+            block_file.traces.extend(traces);
+            block_file.error_traces.extend(error_traces);
+            block_file.events.extend(events);
+            block_file.error_events.extend(error_events);
+
+            if index + 1 < transactions.len() {
+                evm_db.commit(result.state);
+            }
+        }
+
+        block_file.storage_contracts = storage_contracts.into_iter().collect();
+        let state_diff = state_diff_builder.build(block.header.state_root, parent_state_root);
+        let validation_hash = block_file.validation().validation_hash;
+
+        Ok(DebankOutPut {
+            block_file,
+            header,
+            state_diff: alloy_rlp::encode(state_diff).into(),
+            validation_hash,
+        })
     }
 
     /// Returns the trace of a call
