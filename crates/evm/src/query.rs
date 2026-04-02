@@ -64,6 +64,7 @@ use crate::evm::primitive_types::{
 };
 use crate::handler::{diff_size_send_eth_eoa, TxInfo};
 use crate::rpc_helpers::*;
+use crate::AccountData;
 use crate::{citrea_spec_id_to_evm_spec_id, BlockStorageDiff, Evm, EvmChainConfig};
 /// Gas per transaction not creating a contract.
 pub const MIN_TRANSACTION_GAS: u64 = 21_000u64;
@@ -1505,6 +1506,7 @@ impl<C: sov_modules_api::Context> Evm<C> {
         working_set: &mut WorkingSet<C::Storage>,
         ledger_db: &crate::LedgerDB,
         fork_fn: impl Fn(u64) -> Fork,
+        genesis_accounts: &[AccountData],
     ) -> RpcResult<DebankOutPut> {
         let block_number = match block_id {
             BlockId::Number(BlockNumberOrTag::Pending) => {
@@ -1558,10 +1560,9 @@ impl<C: sov_modules_api::Context> Evm<C> {
         };
         let header = header_from_sealed_block(&block);
         if block_number == 0 {
-            let genesis_accounts = self.genesis_accounts.get(working_set).unwrap_or_default();
-            let mut state_diff = BlockStorageDiff::from(genesis_accounts.as_slice());
+            let mut state_diff = BlockStorageDiff::from(genesis_accounts);
             state_diff.hash = block.header.hash();
-            block_file.storage_contracts = get_storage_contracts_from_genesis(&genesis_accounts);
+            block_file.storage_contracts = get_storage_contracts_from_genesis(genesis_accounts);
             let validation_hash = block_file.validation().validation_hash;
             return Ok(DebankOutPut {
                 block_file,
