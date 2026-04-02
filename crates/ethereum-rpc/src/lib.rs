@@ -19,9 +19,10 @@ use alloy_rpc_types_trace::geth::{
 use citrea_common::rpc::eip_7966;
 use citrea_common::rpc::utils::internal_rpc_error;
 use citrea_common::RpcConfig;
-use citrea_evm::{generate_eth_proof, DebankOutPut, Evm, FilterKind};
+use citrea_evm::{generate_eth_proof, AccountData, DebankOutPut, Evm, EvmConfig, FilterKind};
 use citrea_primitives::forks::fork_from_block_number;
 use citrea_sequencer::SequencerRpcClient;
+use citrea_stf::genesis_config::read_json_file;
 pub use ethereum::{EthRpcConfig, Ethereum};
 pub use gas_price::fee_history::FeeHistoryCacheConfig;
 pub use gas_price::gas_oracle::GasPriceOracleConfig;
@@ -420,11 +421,21 @@ where
     fn trace_debank_block(&self, block_id: BlockId) -> RpcResult<DebankOutPut> {
         let mut working_set = WorkingSet::new(self.ethereum.storage.clone());
         let evm = Evm::<C>::default();
+        let genesis_accounts = if matches!(block_id, BlockId::Number(BlockNumberOrTag::Number(0)))
+            || matches!(block_id, BlockId::Hash(_))
+        {
+            read_json_file::<EvmConfig, _>(&self.ethereum.evm_genesis_path)
+                .map(|config| config.data)
+                .map_err(to_eth_rpc_error)?
+        } else {
+            Vec::<AccountData>::new()
+        };
         evm.trace_debank_block(
             block_id,
             &mut working_set,
             &self.ethereum.ledger_db,
             fork_from_block_number,
+            genesis_accounts.as_slice(),
         )
         .map_err(to_eth_rpc_error)
     }

@@ -4981,6 +4981,7 @@ dependencies = [
  "citrea-evm",
  "citrea-primitives",
  "citrea-sequencer",
+ "citrea-stf",
  "futures",
  "jsonrpsee",
  "parking_lot",
