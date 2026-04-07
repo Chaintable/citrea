@@ -5,6 +5,7 @@ use alloy_consensus::{Transaction, TxReceipt};
 use alloy_primitives::{hex, keccak256, Address, BlockHash, BlockNumber, Bytes, B256, U256};
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use alloy_rpc_types_eth::Header;
+use alloy_serde::{OtherFields, WithOtherFields};
 use md5::{Digest as Md5Digest, Md5};
 use revm::bytecode::opcode::OpCode;
 use revm::state::Account;
@@ -283,7 +284,7 @@ impl BlockFile {
 #[serde(rename_all = "snake_case")]
 pub struct DebankOutPut {
     pub block_file: BlockFile,
-    pub header: Header,
+    pub header: WithOtherFields<Header>,
     pub state_diff: Bytes,
     pub validation_hash: i64,
 }
@@ -692,8 +693,8 @@ pub fn account_changeset_from_state(state: &revm::state::EvmState) -> Vec<(Addre
         .collect()
 }
 
-pub fn header_from_sealed_block(block: &SealedBlock) -> Header {
-    Header {
+pub fn header_from_sealed_block(block: &SealedBlock) -> WithOtherFields< Header> {
+    let header = Header {
         inner: alloy_consensus::Header {
             parent_hash: block.header.parent_hash,
             ommers_hash: block.header.ommers_hash,
@@ -720,6 +721,13 @@ pub fn header_from_sealed_block(block: &SealedBlock) -> Header {
         hash: block.header.hash(),
         total_difficulty: None,
         size: None,
+    };
+    WithOtherFields{
+        inner: header,
+        other: OtherFields::from_iter([(
+            "l1FeeRate".to_string(),
+            format!("{:#x}", block.l1_fee_rate).into(),
+        )]),
     }
 }
 
