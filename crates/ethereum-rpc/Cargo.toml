@@ -19,6 +19,7 @@ citrea-common = { path = "../common" }
 citrea-evm = { path = "../evm", features = ["native"] }
 citrea-primitives = { path = "../primitives" }
 citrea-sequencer = { path = "../sequencer" }
+citrea-stf = { path = "../citrea-stf" }
 futures = { workspace = true }
 jsonrpsee = { workspace = true, features = ["http-client", "server"] }
 parking_lot = { workspace = true }

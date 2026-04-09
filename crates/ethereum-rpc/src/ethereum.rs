@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use alloy_primitives::U256;
@@ -26,6 +27,7 @@ pub struct EthRpcConfig {
     pub fee_history_cache_config: FeeHistoryCacheConfig,
     pub stale_filter_ttl: Option<usize>,
     pub enable_filters: bool,
+    pub evm_genesis_path: PathBuf,
 }
 
 pub struct Ethereum<C: sov_modules_api::Context, Da: DaService> {
@@ -39,6 +41,7 @@ pub struct Ethereum<C: sov_modules_api::Context, Da: DaService> {
     pub(crate) trace_cache: Mutex<LruMap<u64, Vec<TraceResult>, ByLength>>,
     pub(crate) subscription_manager: Option<SubscriptionManager>,
     pub(crate) citrea_filter: Arc<CitreaFilter>,
+    pub(crate) evm_genesis_path: PathBuf,
 }
 
 impl<C: sov_modules_api::Context, Da: DaService> Ethereum<C, Da> {
@@ -87,6 +90,7 @@ impl<C: sov_modules_api::Context, Da: DaService> Ethereum<C, Da> {
             trace_cache,
             subscription_manager,
             citrea_filter,
+            evm_genesis_path: eth_rpc_config.evm_genesis_path,
         }
     }
 

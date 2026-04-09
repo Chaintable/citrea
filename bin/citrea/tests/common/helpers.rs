@@ -237,6 +237,7 @@ pub async fn start_rollup(
             da_service.clone(),
             rpc_storage,
             rollup_config.rpc.clone(),
+            runtime_genesis_paths.evm_genesis_path.clone(),
             ledger_db.clone(),
             &mut rpc_module,
             sequencer_client_url,

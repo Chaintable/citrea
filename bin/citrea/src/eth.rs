@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -16,6 +17,7 @@ pub fn register_ethereum<Da: DaService>(
     da_service: Arc<Da>,
     storage: ProverStorage,
     rpc_config: RpcConfig,
+    evm_genesis_path: PathBuf,
     ledger_db: LedgerDB,
     methods: &mut jsonrpsee::RpcModule<()>,
     sequencer_client_url: Option<String>,
@@ -28,6 +30,7 @@ pub fn register_ethereum<Da: DaService>(
             fee_history_cache_config: FeeHistoryCacheConfig::default(),
             stale_filter_ttl: rpc_config.stale_filter_ttl,
             enable_filters: rpc_config.enable_filters,
+            evm_genesis_path,
         }
     };
 

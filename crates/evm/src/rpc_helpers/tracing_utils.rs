@@ -401,7 +401,7 @@ pub(crate) fn trace_transaction<C: sov_modules_api::Context>(
 }
 
 /// Executes the [Env] against the given [Database] without committing state changes.
-fn trace_citrea<DB, I>(
+pub(crate) fn trace_citrea<DB, I>(
     db: DB,
     config_env: CfgEnv,
     block_env: BlockEnv,

@@ -1,6 +1,9 @@
 #![deny(missing_docs)]
 #![doc = include_str!("../README.md")]
 mod call;
+#[cfg(feature = "native")]
+#[allow(missing_docs)]
+mod debank;
 mod evm;
 mod genesis;
 mod hooks;
@@ -12,6 +15,8 @@ use alloy_consensus::TxReceipt;
 pub use alloy_primitives::{keccak256, U256};
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 pub use call::*;
+#[cfg(feature = "native")]
+pub use debank::*;
 pub use evm::*;
 pub use genesis::*;
 #[cfg(feature = "native")]
