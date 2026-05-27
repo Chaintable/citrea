@@ -174,14 +174,17 @@ impl DebankTransaction {
     ) -> Self {
         let recovered: reth_primitives::Recovered<reth_primitives::TransactionSigned> =
             tx.clone().into();
+        let gas_used = receipt.gas_used.max(1);
+        let l1_fee = U256::from(block.l1_fee_rate) * U256::from(receipt.l1_diff_size);
         let effective_gas_price = recovered.effective_gas_price(block.header.base_fee_per_gas);
+        let gas_price = (l1_fee / U256::from(gas_used)) + U256::from(effective_gas_price);
 
         Self {
             id: *recovered.hash(),
             from: recovered.signer(),
             to: recovered.to().unwrap_or_default(),
             gas_limit: recovered.gas_limit(),
-            gas_price: effective_gas_price,
+            gas_price: gas_price.to(),
             gas_used: receipt.gas_used,
             status: receipt
                 .receipt
