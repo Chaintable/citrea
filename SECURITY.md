@@ -1,66 +1,84 @@
-# Citrea Security Information
-This document provides links and contact information for Citrea.
+# Security Policy
 
-## Email Contact
-To contact the Citrea security team by email please use the following email address:
+This repository is a **fork**: upstream [chainwayxyz/citrea](https://github.com/chainwayxyz/citrea)
+plus the [Chaintable pipeline](https://github.com/Chaintable/pipeline) tracer,
+which exports block data (headers, transactions, call traces, receipts, events,
+state diffs) to the Chaintable data pipeline.
 
-```
-security@citrea.xyz
-```
+**First, determine where the issue lives.** The key question: does it reproduce
+on an unmodified upstream build?
 
-If the issue is sensitive, please encrypt your email using the provided GPG key:
+- **Upstream issue** — reproduces on vanilla upstream (typically consensus, p2p
+  networking, EVM execution, transaction pool, standard RPC, storage). It affects
+  every user of the upstream client, not just this fork. **Follow the upstream
+  security process, not this document:**
+  https://github.com/chainwayxyz/citrea/security/policy
 
-```
------BEGIN PGP PUBLIC KEY BLOCK-----
+  We pick up upstream security fixes through periodic upstream merges; please do
+  not disclose upstream vulnerabilities here.
 
-mQINBGhZQXgBEADs4X61A9OcXJ1vbsFwq/tCm8FVCjHx9KADZ7WRht4Tr/4tlrXP
-VT7PeMjf97osh131ofq0i5fmumXSRHRTakn5hUJiIAGPQyaxJd6gXp3U9D8p2Q0S
-xb/8sQmkncIqg1a1ZmUxekbBM0PXDePGMUVCFdpIFGiCh1QEES2Or2vI6PPwPFuA
-VhAre+HGFnhIk0jtHqOntpviHuWx5Oqp7kmelvdvYqMAOjdWUYG7LUyykJc/xBvD
-k9YLYHYa1ItWuQFHsR4GBraTrGOJ7sCgbkT4eneGBQRdwnhRxuWWsDyC5BKT2mq1
-RmhVMd4RmYdmmvlIk9ACOGHRDV4Hi7ymZTgCH1DOhBDHoTHtq4SKUsFHh0+BnZZH
-PNGOnw3fRq8mC6tOrBQrf1/iTWPoM3i6hZlBWKdhQf0mwuF5DAo5mvYXc2RUUwY/
-pfYWjiEr+ItanJrzkLPDMedPdMbAW/87CpAKoGkMeg6CmftQgPE30Ksue3b6HExz
-wrHIrqqD8JqWxwLIp0eMkh7soMp1avFCUOx57c1hXP3bqGEX9AABur4b3MyIp2QZ
-jeyzmXc+3Z4XYZpJz98YRiiQQBkOZ+eZgrTPq7JoQ8gG8GnngEmPY67Ak+dWtRNR
-hSJb3mQHwrveoX1aRp7+wtsWpIqplxdEulg7LqHDHyHAYN+h2sO8JPdvhQARAQAB
-tCVTZWN1cml0eSBDaXRyZWEgPHNlY3VyaXR5QGNpdHJlYS54eXo+iQJOBBMBCAA4
-FiEEJrjWfVY4H6mv/nsGxnvc0y/0jG4FAmhZQXgCGwMFCwkIBwIGFQoJCAsCBBYC
-AwECHgECF4AACgkQxnvc0y/0jG4cdA//V/FR/n1aA58VTOY2Rsf/ou45Dc4SRihJ
-PO0fMtsbtKGGEopYob522hUlEqxvq4Kw1g73PXjlhFMD8Qvne/yoKJ9plsKbd121
-DZ9aSGoycAoaFzDX1zUJfSUaEuGu7V6wymdRz48/gC+zQw0gPCE+Muf/Bd7ZNOui
-wNoBPSRWG/3Z1pyaAqjAHlRHQ+T9ue7veqVxHQUkQy4nz2kOsHLu4g/LUNjvtqC8
-h4MweQbzyvgjULZkZZYjpWaRtgwCqqhvho46AwVcZ2HOSj+xRc0TQUvx3h74I4vO
-vvjZQymIkp0bCQ8muemiZeMpolXh6YH3rWir1Xi72ljgJMI38PD1cd1QlLaFGuoL
-yLPTUNUwOmrRI7gDLeyL5LbxvfojGDhpmiGeMQEHYj3fGFEmBjX4yZTsX+ZmQTHC
-NH8X8aDFcHMhKxnntUj4O+qWHwSqY72NtKvJhfOZwZUNBH6/zHElyZbHftV2jbKB
-QRPrPBmA9qcV91d6IwDrTKUr0xOGJCY9MtATlkSFpfCYxGGgPPw028QlNUlpVG1A
-KV79kpYJJPZKF3iFgu00T8PSoAbQvosVCDytb7cYZfdFW51xUZ4T7Lg8Ll/NgX/X
-nEcc9Z5NvKUkZZ6R30Pj4rzwIsIPoZaDumkJw9GF7LRArurgyl1e0jAkDk4uwzFE
-Jijf9586ypi5Ag0EaFlG3wEQALcC3wL/hBNWvjx51Wl7zRUwr3tJFjKZ4rQrJzII
-zsj+R9BZOAvp3Uo/WK4m0oAWLeqhP37m7vn0zoWJzZrOjX5NhuaGNyo3bCBlFvLV
-p6R+NyamPqVutSNBbh/Do3F15AdTKaQQidesrNzf0UuVk8wI6jCJKcJODCsdxA3Y
-QaoF8uVB9Rcx5EktB5o44hJH78/a8tIZFM5VuesbRBxtItyDeIpG+VZZMAFqx740
-B7PoOs/HUtvY683bfidH9EtV7sOMPgUnRMfyFgUTfQPdyOzrUF1h2G92bEupD35U
-xiUT43X48UCZl6uOYScKa4/8ftpPmwdWBrBRkLbhI2wCOun/Kthdww03H738AuUa
-JuJOBevuquH2ULjdZfHEj9Hqo32x1dbFueLfoR2Rp2nFlAGVyoTCsNxHVuXySSq6
-kWZBFJi3e0R5+LkVV2tztn/9EBqYXKSRADhbR1BNdJbCMIAk9caLDnD7cPkiS3CQ
-URQMz/G95InasXgGmBM6rno5dGhJZ3XD+mWPg/eRtvICYaVSo87rR60GEh36IvBe
-kHIdxRkIyjZASbJI+f+00Lxk7D8ZmPZjQ+HrsaWOZq6FDRd9dM9OwFqk4MJBOAeI
-1I76VDUsVH3rzeWmVs7vUWFMdFczY6xYpP7sJQkP26Res0rxTGSU5C80tiLcykqN
-mECZABEBAAGJAjwEGAEIACYWIQQmuNZ9Vjgfqa/+ewbGe9zTL/SMbgUCaFlG3wIb
-DAUJB4YfagAKCRDGe9zTL/SMbm33D/4rB3w9iXxRF9T1QUIfUajvZbWVGmbDFiZ1
-XB0JI38EqgUKGm36ykyQbcfSeJKNgWBkOEEO8q9fw8EARkZPbv9fSDtW/3i5jNIW
-ygSN36fAIaIUWcZ+Rnkl8C5/9cYIgZuwaWYBearlW75GPqGMNbW92U1GN93QWn3l
-Q5/I474MJdHpQpGFOVnhitoLPqBxFOxhRoxSpMQaL8iozmAN7N5K002TcYt95JiO
-rH2T3YgOdCnEbDAfpnpvWqMqBtu3ydXnLcHmVuuHJSCaE9tM/WcdUdiLHP9D4qZB
-FxY9nFycgH9pYhPAvgSE/HM7HePx9kc22wJiXLzXviGIFYl40su+lzs4fuFMgC6E
-c9Hj39reL85QaobPNJI+dcgpsVs0xsKROXPyZYQai8PayJJc1f1V+/tMS14ef7MM
-LIYvMmi1uPFaRCFEHnA4onXkB52rYXt5acyrl24a5eDNZD/qRrrDKMqkgXrPrxHJ
-23S73LUQFpvDQ+DA/fZor516H3HWHYro1nINLXwip1cX2e2AoaJFP+gWZ2HCypWZ
-WkSRLz/cyZC1U7LdMA5Z3whFAwVcI91FHEgbMgdGTWGtNbeKOp5sDqIgmduxXzCu
-6Ztsw6ECa11z3k977nN+56AKH/OdbrEtHu9lZLds8yglJpgp9JN7f54CadhxIozi
-cXvJNNsO+w==
-=0vMP
------END PGP PUBLIC KEY BLOCK-----
-```
+- **This fork's issue** — only reproduces with this fork's binaries or published
+  images, or involves the Chaintable pipeline layer: the pipeline tracer and its
+  block-data output, the Dockerfile / image build, or the CI workflows.
+  **Follow our process below.**
+
+---
+
+## Our Process (issues in the Chaintable pipeline layer)
+
+### Supported Versions
+
+We provide security updates for the latest `main` branch and recent releases.
+
+| Version | Supported |
+|---------|----------|
+| main    | ✅       |
+| Latest release | ✅ |
+| older versions   | ❌ |
+
+### Reporting a Vulnerability
+
+If you discover a security issue in the Chaintable pipeline layer, **do not open
+a public issue**.
+
+Please report it privately:
+
+- GitHub Security Advisory on this repository (preferred)
+- Email: bugbounty@debank.com
+
+Include:
+
+- Description of the issue
+- Impact / severity assessment
+- Steps to reproduce
+- Proof of concept (if available)
+
+### Response Process
+
+We aim to:
+
+- Acknowledge within **72 hours**
+- Provide initial assessment within **3–5 days**
+- Fix and release as soon as possible depending on severity
+
+### Disclosure Policy
+
+- We follow **responsible disclosure**
+- Fixes may be developed privately before public release
+- Credit will be given unless you request anonymity
+
+### Scope
+
+Typical security-relevant areas of the Chaintable pipeline layer include:
+
+- Integrity of the emitted block data (ordering, duplication, corruption)
+- The pipeline tracer and any RPC endpoints it adds
+- Resource exhaustion introduced by the pipeline tracer (memory / goroutine leaks)
+- The published Docker images and the build / CI pipeline
+
+### Notes
+
+This fork is a data producer for the
+[Chaintable pipeline](https://github.com/Chaintable/pipeline): its output feeds
+downstream indexing and query systems. Security issues here may propagate
+downstream — please report anything suspicious.

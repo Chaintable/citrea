@@ -1,57 +1,117 @@
-## How to contribute to Citrea
+# Contributing
 
-Thank you for your interest in contributing to Citrea! We accept and appreciate all kinds of contributions. Before moving on, we highly advise you to read this document to be an effective contributor.
+Thanks for your interest in contributing.
 
-## On questions
+This repository is a **fork**: upstream [chainwayxyz/citrea](https://github.com/chainwayxyz/citrea)
+plus the [Chaintable pipeline](https://github.com/Chaintable/pipeline) tracer. It
+runs write node(s) that produce block data for the Chaintable data pipeline, for
+the chain(s) listed in this repository's CI configuration and README. It is not
+a general-purpose fork of chainwayxyz/citrea.
 
-If you have some questions regarding the project or the repository, or if there are parts in the code that you could not understand, please visit our [Discord](https://discord.citrea.xyz). You can ask your technical questions regarding the project/repository in the #developer-chat there.
+**First, determine where your change belongs:**
 
-Using issues for questions creates lots of noise on the codebase, so we kindly ask you to follow this convention.
+- **Chain client changes** (consensus, p2p, EVM, RPC, txpool) — contribute
+  **upstream**, following their contributing process. We cannot accept
+  chain-core changes in this fork: they would diverge from upstream and be lost
+  or cause conflicts at the next upstream merge. If an upstream fix matters to
+  this fork, open an issue here linking the upstream PR/commit and we will pull
+  it in with the next sync.
 
-### Issues
+- **Pipeline layer changes** — the pipeline tracer and its block-data output,
+  the Dockerfile, published images, CI workflows, or docs about running this
+  write node — contribute **here**, following the process below.
 
-If you see any problems regarding to code, or if you have any feature requests to be completed in the future, you may open an issue. However, before doing so, please search through the issues and pull requests to see if it's been done before to not to cause a duplicate issue.
+---
 
-We have two different issue templates, one for the bugs and one for the feature requests. Please open issues using these templates. If you believe that your issue does not cover all of the fields in these templates, you can skip or leave some fields short. However, in general, you should write all necessary details for others to understand or develop on top of that.
+## Our Process (contributions to the Chaintable pipeline layer)
 
-Along with that, we expect the issue owner to be active in discussions when necessary (i.e. when steps could not be reprocuded or request is not clear), so please be aware of that.
+### Getting Started
 
-#### On typo fixes
+Requirements:
 
-We do not accept typo fixes as issues / pull requests as of now. If you want to contribute in that sense still, you may state it in our [Discord](https://discord.citrea.xyz).
+* Rust (see `Cargo.toml` / `rust-toolchain`)
+
+### Development Workflow
+
+1. Fork the repository
+2. Create a branch from `main`
+3. Make changes, focused on the pipeline layer
+4. Run local checks
+5. Open a PR
+
+Keep PRs small and focused.
+
+### Local Checks (must pass)
+
+```bash
+make build
+make test
+```
+
+### Code Guidelines
+
+* Keep the diff minimal — prefer hooks over invasive edits to client code
+* Match the existing code style and conventions (`gofmt`)
+* Prefer simple and explicit logic
+* Do not change chain-core behavior (see the top of this document)
+
+### Testing
+
+Changes to the pipeline layer must include tests where practical. At minimum,
+describe how you verified the emitted data: chain, block range, and what you
+compared it against.
 
 ### Pull Requests
 
-Let's say you decided to contribute through the code. Great! Now, firstly, before forking the repository and starting to work - please check other issues & pull requests to see whether the particular part you're interested in has been
+Before submitting:
 
-- Discussed
-- Completed
-- Abandoned (closed)
+* Local checks pass
+* Tests added or updated
+* Behavior changes clearly explained
 
-After that, you may either request a task for yourself from the issues, or open an issue and state that you want to work on it. We, as maintainers, will gladly assign that particular section to you.
+PRs should include:
 
-#### Continuous Integration
+* Summary
+* Motivation
+* Testing details
+* Compatibility impact
 
-We have an integrated CI workflow in our repository, with Rust version set to stable. It runs the following on pull requests and pushes to the nightly branch:
+Note on CI: it builds the Docker images for this repository, and the image
+publishing steps need repository credentials, which GitHub does not provide to
+pull requests from forks — those steps failing on a fork PR is expected. A
+maintainer will build and verify your change on an internal branch.
 
-| Check   | Command for you to run in local |
-| ------- | ------------------------------- |
-| Lint    | `SKIP_GUEST_BUILD=1 make lint`  |
-| Tests   | `make test`                     |
-| No-std  | `make check-no-std`             |
-| Foundry | `forge test -vvv`               |
+### Commit Guidelines
 
-We kindly expect you to run these and check everything is correct on your side before opening a ready Pull Request. We do not merge things until these pass, as expected :) If you want to check more about this workflow, feel free the to check it from [here](https://github.com/chainwayxyz/citrea/blob/nightly/.github/workflows/checks.yml).
+* Use clear, descriptive messages
 
-#### Styling
+Example:
 
-There's also a Git Hook for you to run, in terms of styling. You can see / run it from [here](https://github.com/chainwayxyz/citrea/blob/nightly/.githooks/pre-commit).
-Alternatively, you can run `make set-git-hook` to configure it automatically via the [Makefile](https://github.com/chainwayxyz/citrea/blob/585c84a921ba0e896f449a203d199d5bac34050d/Makefile#L72).
+```
+tracer: fix state-diff ordering for reorged blocks
+```
 
-### Code of Conduct
+### Releases
 
-Our project complies with the [Code of Conduct](https://www.rust-lang.org/policies/code-of-conduct) of Rust. We expect all contributors to agree on this before contributing to the repository.
+* Release tags follow `v<base-version>-ct.N` (`ct` = Chaintable; e.g.
+  `v2.3.1-ct.5`); a GitHub Release publishes the versioned images
+
+### Reporting Issues
+
+Please include:
+
+* Image tag or commit
+* Chain and block height
+* Reproduction steps
+* Expected vs actual behavior
+
+### Security
+
+Do not disclose vulnerabilities publicly.
+
+See [SECURITY.md](./SECURITY.md) for reporting instructions.
 
 ### License
 
-All contributions under this repository will be covered by the [GPLv3](https://github.com/chainwayxyz/citrea/blob/nightly/COPYING) License.
+By contributing, you agree that your contributions are licensed under the same
+terms as this repository — see [COPYING](./COPYING) (GPL-3.0).
