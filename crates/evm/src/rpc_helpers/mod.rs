@@ -19,7 +19,7 @@ mod tracing_utils;
 
 use sov_modules_api::{StateMapAccessor, WorkingSet};
 use sov_state::storage::{NativeStorage, StateCodec, StorageKey};
-pub(crate) use trace_limit::TraceMemoryUsage;
+pub(crate) use trace_limit::{TraceMemoryBudget, TraceMemoryUsage};
 pub use trace_limit::{mb_to_bytes, trace_memory_limit_exceeded};
 pub(crate) use tracing_utils::*;
 
