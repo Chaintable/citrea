@@ -1,8 +1,82 @@
 # Changelog
 ## [Unreleased]
 
-## [v2.3.1](2026-03-31)
 
+## [v3.0.0](2026-11-23)
+v3.0.0 introduces the Pomelo upgrade and migrates proving from RISC Zero to SP1.
+
+Pomelo activates on mainnet at L2 block `15759000` (~Nov 25 2026, 3:30 PM UTC). Nodes have until then to upgrade: a v2 node stops syncing at the first Pomelo block until it runs v3.0.0.
+
+With this upgrade:
+- Batch proofs and light client proofs are SP1 proofs. Mainnet SP1 proving continues from the RISC Zero light client proof of Bitcoin block `977169`.
+- Several other fixes
+
+### Full nodes
+Stop v2 and start v3.0.0 on the same database. No rollback is needed: on its first start v3.0.0 rescans L1 from Bitcoin block `977169` on its own, to read the SP1 proofs v2 discarded.
+
+A full node synced from scratch on v3.0.0 accepts the RISC Zero proofs up to Bitcoin block `977169` on the batch prover's DA signature, without verifying them. To verify them, sync with v2.10.0 up to that block and then switch to v3.0.0.
+
+
+## [v2.10.0](2026-11-02)
+### Changed
+- fix(rpc): return all unpolled logs from `eth_getFilterChanges` ([#3349](https://github.com/chainwayxyz/citrea/pull/3349))
+- fix(rpc): bound method labels in RPC metrics ([#3348](https://github.com/chainwayxyz/citrea/pull/3348))
+- fix(rpc): cap `eth_feeHistory` reward percentiles to 100 ([#3347](https://github.com/chainwayxyz/citrea/pull/3347))
+- fix(rpc): limit `eth_getProof` storage keys to 1024 ([#3346](https://github.com/chainwayxyz/citrea/pull/3346))
+
+## [v2.9.0](2026-10-26)
+### Changed
+- feat(rpc): configurable gas, memory, and concurrency limits for `debug_trace*` and `eth_call` ([#3344](https://github.com/chainwayxyz/citrea/pull/3344))\
+  **New env vars:**\
+  `RPC_GAS_CAP`: Max gas for `eth_call` and `debug_traceCall`, decoupled from the block gas limit (default: 100000000, also the enforced maximum; 0 keeps the block gas limit)\
+  `RPC_TRACE_MEMORY_LIMIT_MB`: Approximate memory a single `debug_trace*` request may retain before it is aborted (default: 512; 0 disables)\
+  `RPC_TRACE_CACHE_LIMIT_MB`: Megabytes of block traces kept in the `debug_trace*` cache (default: 512)\
+  `RPC_MAX_TRACING_REQUESTS`: Max concurrent `debug_trace*` requests; the rest queue (default: 4)
+- feat(sequencer): Snapshot the in-memory mempool on graceful shutdown and revalidate transactions on startup, without going through DB.
+- fix(rpc): return one noopTracer result per tx in block traces ([#3339](https://github.com/chainwayxyz/citrea/pull/3339))
+
+## [v2.8.0](2026-09-10)
+### Changed
+- fix(bitcoin-da): Harden DA monitoring reveal restore ([#3329](https://github.com/chainwayxyz/citrea/pull/3329))
+- fix(rpc): Set archival state in estimate tx expenses ([#3321](https://github.com/chainwayxyz/citrea/pull/3321))
+- fix(rpc): with log config in debug trace cache ([#3323](https://github.com/chainwayxyz/citrea/pull/3323))
+
+## [v2.7.0](2026-07-29)
+### Changed
+- perf: better tx validation in mempool ([#3311](https://github.com/chainwayxyz/citrea/pull/3311))\
+  **New env vars:**\
+  `SEQUENCER_MEMPOOL_ADDITIONAL_VALIDATION_TASKS`: Number of additional parallel transaction validation tasks in the sequencer mempool (default: 4)\
+  `SEQUENCER_DRY_RUN_TIME_LIMIT_MS`: Time budget in milliseconds for the sequencer's per-block transaction-selection (dry run) loop (default: 500)
+- fix(fullnode): pending commitment overwrites & failing pending proofs ([#3317](https://github.com/chainwayxyz/citrea/pull/3317))
+### Added
+- feat: full node state diff rpc ([#3310](https://github.com/chainwayxyz/citrea/pull/3310))
+
+## [v2.6.0](2026-06-16)
+### Added
+- feat: support get last scanned l1 height in sequencer rpc ([#3298](https://github.com/chainwayxyz/citrea/pull/3298))
+
+## [v2.5.0](2026-06-04)
+Due to a bug in the build system, this version is unusable. Please skip this version and use `v2.6.0` instead.
+### Added
+- feat: Get raw transaction rpcs. ([#3201](https://github.com/chainwayxyz/citrea/pull/3201))
+- feat: add `lightClientProver_createCircuitInput` RPC to return serialized light client circuit input by L1 height ([#3290](https://github.com/chainwayxyz/citrea/pull/3290))
+- fix: Fix ignoring state overrides in eth_estimateDiffSize ([#3296](https://github.com/chainwayxyz/citrea/pull/3296))
+
+### Changed
+- fix: use deterministic boundless patch and unpin ubuntu ci.([#3216](https://github.com/chainwayxyz/citrea/pull/3216))
+- fix(bitcoin-da): correct doc comment on `INITIAL_TESTNET4_STATE`. ([#3227](https://github.com/chainwayxyz/citrea/pull/3227))
+- refactor: remove proving session recovery ([#3288](https://github.com/chainwayxyz/citrea/pull/3288))\
+  **Removed env var:**\
+    `ENABLE_RECOVERY`
+- fix: Use price related fields in Boundless pricing client as U256. ([#3291](https://github.com/chainwayxyz/citrea/pull/3291))
+
+## [v2.4.0](2026-04-06)
+This version updates RocksDB, underlying database of Citrea nodes.
+### Changed
+- perf: Mine reveal prefix relying on `sign_schnorr` internal randomness.([#3192](https://github.com/chainwayxyz/citrea/pull/3192))
+- chore: bump rocksdb and use jemalloc feature ([#2983](https://github.com/chainwayxyz/citrea/pull/2983))
+
+## [v2.3.1](2026-03-31)
 Fix version. Only provers must update.
 
 ### Changed
@@ -17,7 +91,7 @@ Fix version. Only provers must update.
 
 ### Changed
 - fix(fullnode): avoid rewriting pending proofs on retry (reduces PendingProof retry-path rewrite amplification). ([#3176](https://github.com/chainwayxyz/citrea/pull/3176))
-- fix: set L1 fee rate to zero in `eth_estimateGas` if sender has no balance ([#3169](https://github.com/chainwayxyz/citrea/pull/3169)) 
+- fix: set L1 fee rate to zero in `eth_estimateGas` if sender has no balance ([#3169](https://github.com/chainwayxyz/citrea/pull/3169))
 
 ## [v2.2.0](2026-03-02)
 ### Added
@@ -240,7 +314,15 @@ For a detailed list of changes, see auto generated changelog at [v0.6.0 release 
 - Fix bug where full nodes try verifying sequencer commitments which they have not synced up to. ([#1220](https://github.com/chainwayxyz/citrea/pull/1220))
 - Set default priority fee to 0. ([#1226](https://github.com/chainwayxyz/citrea/pull/1226))
 
-[unreleased]: https://github.com/chainwayxyz/citrea/compare/v2.3.1...HEAD
+[unreleased]: https://github.com/chainwayxyz/citrea/compare/v3.0.0...HEAD
+[v3.0.0]: https://github.com/chainwayxyz/citrea/compare/v2.10.0...v3.0.0
+[v2.10.0]: https://github.com/chainwayxyz/citrea/compare/v2.9.0...v2.10.0
+[v2.9.0]: https://github.com/chainwayxyz/citrea/compare/v2.8.0...v2.9.0
+[v2.8.0]: https://github.com/chainwayxyz/citrea/compare/v2.7.0...v2.8.0
+[v2.7.0]: https://github.com/chainwayxyz/citrea/compare/v2.6.0...v2.7.0
+[v2.6.0]: https://github.com/chainwayxyz/citrea/compare/v2.5.0...v2.6.0
+[v2.5.0]: https://github.com/chainwayxyz/citrea/compare/v2.4.0...v2.5.0
+[v2.4.0]: https://github.com/chainwayxyz/citrea/compare/v2.3.1...v2.4.0
 [v2.3.1]: https://github.com/chainwayxyz/citrea/compare/v2.3.0...v2.3.1
 [v2.3.0]: https://github.com/chainwayxyz/citrea/compare/v2.2.0...v2.3.0
 [v2.2.0]: https://github.com/chainwayxyz/citrea/compare/v2.1.0...v2.2.0

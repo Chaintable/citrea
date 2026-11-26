@@ -4,16 +4,17 @@ use std::time::Duration;
 
 use alloy::consensus::constants::KECCAK_EMPTY;
 use alloy::hex::FromHex;
+use alloy::network::eip2718::Encodable2718;
 use alloy::network::TransactionResponse;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::SignerSync;
 // use citrea::initialize_logging;
-use alloy_primitives::{Address, Bytes, U256, U64};
+use alloy_primitives::{Address, Bytes, B256, U256, U64};
 use alloy_rpc_types::{
     Authorization, BlockId, BlockNumberOrTag, EIP1186AccountProofResponse, Filter,
     TransactionRequest, ValueOrArray,
 };
-use citrea_common::risc0::Risc0HostConfig;
+use citrea_common::sp1::SP1HostConfig;
 use citrea_common::{BatchProverConfig, FromEnv, SequencerConfig};
 use citrea_evm::smart_contracts::{
     CallerContract, LogsContract, SimpleStorageContract, TestContract,
@@ -39,6 +40,7 @@ use crate::common::{
 
 mod archival_state;
 mod diff_sizes;
+mod eth_call_gas_cap;
 mod fee;
 mod gas_price;
 mod precompiles;
@@ -527,6 +529,46 @@ async fn test_eth_get_proof() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(acc_proof_latest, acc_proof_2);
     }
 
+    // Count every requested key, including duplicates, and reject before resolving the block.
+    for block in [
+        None,
+        Some(BlockNumberOrTag::Latest),
+        Some(BlockNumberOrTag::Pending),
+        Some(BlockNumberOrTag::Number(u64::MAX)),
+    ] {
+        for keys in [
+            vec![U256::ZERO; 1025],
+            (0u64..1025).map(U256::from).collect(),
+        ] {
+            let err = seq_test_client
+                .eth_get_proof(contract_address, keys, block)
+                .await
+                .map(|_| ())
+                .expect_err("eth_getProof must reject more than 1024 storage keys");
+            let err = err.downcast::<jsonrpsee::core::client::Error>()?;
+            let jsonrpsee::core::client::Error::Call(err) = err.as_ref() else {
+                panic!("expected a JSON-RPC error, got {err}");
+            };
+            assert_eq!(err.code(), -32602);
+            assert_eq!(
+                err.message(),
+                "too many storage keys requested (max 1024, got 1025)"
+            );
+        }
+    }
+
+    // Account-only proofs and the inclusive storage-key boundary must still work.
+    for keys in [vec![], (0u64..1024).map(U256::from).collect()] {
+        let proof = seq_test_client
+            .eth_get_proof(contract_address, keys.clone(), None)
+            .await?;
+        assert_eq!(proof.storage_proof.len(), keys.len());
+        for (entry, key) in proof.storage_proof.iter().zip(keys) {
+            assert_eq!(entry.key.as_b256(), B256::from(key));
+        }
+        check_proof(&proof, contract_address);
+    }
+
     seq_task.graceful_shutdown();
     Ok(())
 }
@@ -806,6 +848,94 @@ async fn execute(client: &Box<TestClient>) -> Result<(), Box<dyn std::error::Err
         .await;
     assert_eq!(tx_by_number.tx_hash(), tx_hash);
     assert_eq!(tx_by_number_tag.tx_hash(), tx_hash);
+
+    // Assert getRawTransactionByBlockHashAndIndex
+    let raw_tx_by_block_hash = client
+        .eth_get_raw_tx_by_block_hash_and_index(second_block.header.hash, U64::from(0))
+        .await;
+    assert!(raw_tx_by_block_hash.is_some());
+    // Verify the raw bytes hash to the correct transaction hash
+    assert_eq!(
+        alloy::primitives::keccak256(raw_tx_by_block_hash.as_ref().unwrap()),
+        tx_hash,
+        "Raw tx by block hash should hash to the original transaction hash"
+    );
+
+    // Assert getRawTransactionByBlockHashAndIndex with invalid index returns None
+    let raw_tx_invalid_index = client
+        .eth_get_raw_tx_by_block_hash_and_index(second_block.header.hash, U64::from(99))
+        .await;
+    assert!(raw_tx_invalid_index.is_none());
+
+    // Assert getRawTransactionByBlockHashAndIndex with non-existent block hash returns None
+    let raw_tx_invalid_block = client
+        .eth_get_raw_tx_by_block_hash_and_index(B256::ZERO, U64::from(0))
+        .await;
+    assert!(raw_tx_invalid_block.is_none());
+
+    // Assert getRawTransactionByBlockNumberAndIndex
+    let raw_tx_by_number = client
+        .eth_get_raw_tx_by_block_number_and_index(BlockNumberOrTag::Number(2), U64::from(0))
+        .await;
+    assert!(raw_tx_by_number.is_some());
+    assert_eq!(
+        alloy::primitives::keccak256(raw_tx_by_number.as_ref().unwrap()),
+        tx_hash,
+        "Raw tx by block number should hash to the original transaction hash"
+    );
+
+    // Assert getRawTransactionByBlockNumberAndIndex with Latest tag
+    let raw_tx_by_latest = client
+        .eth_get_raw_tx_by_block_number_and_index(BlockNumberOrTag::Latest, U64::from(0))
+        .await;
+    assert!(raw_tx_by_latest.is_some());
+    assert_eq!(
+        alloy::primitives::keccak256(raw_tx_by_latest.as_ref().unwrap()),
+        tx_hash,
+        "Raw tx by Latest tag should hash to the original transaction hash"
+    );
+
+    // Assert getRawTransactionByBlockNumberAndIndex with invalid index returns None
+    let raw_tx_invalid_num_index = client
+        .eth_get_raw_tx_by_block_number_and_index(BlockNumberOrTag::Number(2), U64::from(99))
+        .await;
+    assert!(raw_tx_invalid_num_index.is_none());
+
+    // Verify both block-based raw transaction methods return the same bytes
+    assert_eq!(
+        raw_tx_by_block_hash.as_ref().unwrap(),
+        raw_tx_by_number.as_ref().unwrap(),
+        "Raw tx by block hash and by block number should be identical"
+    );
+
+    // Assert getRawTransactionByHash
+    let raw_tx_by_hash = client.eth_get_raw_transaction_by_hash(tx_hash, None).await;
+    assert!(raw_tx_by_hash.is_some());
+
+    // Encode the transaction locally and verify it matches the RPC response
+    let tx_obj = client
+        .eth_get_transaction_by_hash(tx_hash, None)
+        .await
+        .expect("Transaction should exist");
+    let locally_encoded: Bytes = tx_obj.inner.encoded_2718().into();
+    assert_eq!(
+        raw_tx_by_hash.as_ref().unwrap(),
+        &locally_encoded,
+        "Raw tx by hash should match locally encoded transaction bytes"
+    );
+
+    // Also verify consistency with block-based raw transaction methods
+    assert_eq!(
+        raw_tx_by_hash.as_ref().unwrap(),
+        raw_tx_by_block_hash.as_ref().unwrap(),
+        "Raw tx by hash and by block hash should be identical"
+    );
+
+    // Assert getRawTransactionByHash with non-existent hash returns None
+    let raw_tx_nonexistent = client
+        .eth_get_raw_transaction_by_hash(B256::ZERO, None)
+        .await;
+    assert!(raw_tx_nonexistent.is_none());
 
     let get_arg: U256 = client
         .contract_call(contract_address, contract.get_call_data(), None)
@@ -1494,9 +1624,8 @@ async fn test_safe_finalized_tags() {
             proving_mode: citrea_common::ProverGuestRunConfig::Execute,
             // Make it impossible for proving to happen
             proof_sampling_number: 1_000_000,
-            enable_recovery: true,
             max_commitments_per_proof: None,
-            risc0_host: Risc0HostConfig::from_env().expect("Failed to load Risc0HostConfig"),
+            sp1_host: SP1HostConfig::from_env().expect("Failed to load SP1HostConfig"),
         }),
         None,
         rollup_config,

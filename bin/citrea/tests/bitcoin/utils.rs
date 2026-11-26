@@ -8,6 +8,7 @@ use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use anyhow::bail;
 use bitcoin_da::fee::FeeService;
+use bitcoin_da::helpers::builders::da_public_key;
 use bitcoin_da::monitoring::{MonitoringConfig, MonitoringService};
 use bitcoin_da::network_constants::get_network_constants;
 use bitcoin_da::service::{network_to_bitcoin_network, BitcoinService, BitcoinServiceConfig};
@@ -221,10 +222,16 @@ pub async fn spawn_bitcoin_da_service(
 
     let network = network_to_bitcoin_network(&chain_params.network);
     let network_constants = get_network_constants(&network);
+    let expected_da_public_key = da_config
+        .parse_da_private_key()
+        .unwrap()
+        .as_ref()
+        .map(da_public_key);
     let (monitoring_service, block_rx) = MonitoringService::new(
         client.clone(),
         da_config.monitoring.clone(),
         network_constants.finality_depth,
+        expected_da_public_key,
     );
     let monitoring_service = Arc::new(monitoring_service);
 
@@ -309,7 +316,7 @@ pub async fn wait_for_prover_job(
 
         let now = Instant::now();
         if start + timeout <= now {
-            bail!("Timeout. Failed to get prover job {}", job_id);
+            bail!("Timeout. Failed to get prover job {job_id}");
         }
 
         sleep(Duration::from_secs(1)).await;
@@ -326,10 +333,7 @@ pub async fn wait_for_prover_job_count(
 
     loop {
         if start.elapsed() >= timeout {
-            bail!(
-                "BatchProver failed to reach proving job count {} on time",
-                count
-            );
+            bail!("BatchProver failed to reach proving job count {count} on time");
         }
 
         let jobs = batch_prover

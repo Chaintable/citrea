@@ -24,18 +24,14 @@ use crate::REVEAL_OUTPUT_AMOUNT;
 /// UTXO selection strategy when queue has pending transactions.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum UtxoSelectionMode {
     /// Default behaviour, always use latest UTXO and keep transactions chained
     /// Maintain a single sequential transaction chain.
+    #[default]
     Chained,
     /// Choose the UTXO with the highest amount of confirmations and run parallel UTXO chains
     Oldest,
-}
-
-impl Default for UtxoSelectionMode {
-    fn default() -> Self {
-        Self::Chained
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -52,15 +48,17 @@ pub struct UtxoContext {
 /// Queries available UTXOs via bitcoin RPC, filters based on mode and queue state,
 /// and ensures available UTXOs don't conflict with queued transactions.
 #[derive(Debug)]
-pub(crate) struct UtxoManager {
+pub struct UtxoManager {
     client: Arc<Client>,
     monitoring: Arc<MonitoringService>,
     tx_queue: Arc<Mutex<VecDeque<SignedTxPair>>>,
     network_constants: NetworkConstants,
+    /// UTXO selection mode.
     pub mode: UtxoSelectionMode,
 }
 
 impl UtxoManager {
+    /// Creates a UTXO manager.
     pub fn new(
         client: Arc<Client>,
         monitoring: Arc<MonitoringService>,

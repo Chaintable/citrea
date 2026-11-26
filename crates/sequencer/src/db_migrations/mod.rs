@@ -1,13 +1,17 @@
 use std::sync::OnceLock;
 
+use bitcoin_da::db_migrations::ReencodeShortHeaderProofs;
 use sov_db::ledger_db::migrations::LedgerMigration;
 
 /// Migration to drop unused fullnode tables from sequencer databases
 mod drop_fullnode_tables;
+/// Migration to drop the persistent mempool table
+mod drop_mempool_txs;
 /// Migration to drop the pending commitments table
 mod drop_pending_commitments;
 
 use drop_fullnode_tables::DropFullnodeTables;
+use drop_mempool_txs::DropMempoolTxs;
 use drop_pending_commitments::DropPendingCommitments;
 
 /// Returns the list of migrations that need to be executed in the next fork.
@@ -18,6 +22,8 @@ pub fn migrations() -> &'static Vec<Box<dyn LedgerMigration + Send + Sync + 'sta
         vec![
             Box::new(DropFullnodeTables),
             Box::new(DropPendingCommitments),
+            Box::new(DropMempoolTxs),
+            Box::new(ReencodeShortHeaderProofs),
         ]
     })
 }

@@ -5,6 +5,8 @@
 
 use std::sync::OnceLock;
 
+use bitcoin_da::db_migrations::ReencodeShortHeaderProofs;
+use sov_db::ledger_db::migrations::drop_legacy_proving_sessions::DropLegacyProvingSessions;
 use sov_db::ledger_db::migrations::LedgerMigration;
 
 /// Returns the list of database migrations to apply
@@ -18,5 +20,10 @@ use sov_db::ledger_db::migrations::LedgerMigration;
 pub fn migrations() -> &'static Vec<Box<dyn LedgerMigration + Send + Sync + 'static>> {
     static MIGRATIONS: OnceLock<Vec<Box<dyn LedgerMigration + Send + Sync + 'static>>> =
         OnceLock::new();
-    MIGRATIONS.get_or_init(std::vec::Vec::new)
+    MIGRATIONS.get_or_init(|| {
+        vec![
+            Box::new(DropLegacyProvingSessions),
+            Box::new(ReencodeShortHeaderProofs),
+        ]
+    })
 }

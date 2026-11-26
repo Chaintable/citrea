@@ -2,7 +2,7 @@
 use std::time::Duration;
 
 use alloy_primitives::U64;
-use citrea_common::risc0::Risc0HostConfig;
+use citrea_common::sp1::SP1HostConfig;
 use citrea_common::{BatchProverConfig, FromEnv, SequencerConfig};
 use citrea_stf::genesis_config::GenesisPaths;
 use rs_merkle::algorithms::Sha256;
@@ -74,9 +74,8 @@ async fn full_node_verify_proof_and_store() {
         Some(BatchProverConfig {
             proving_mode: citrea_common::ProverGuestRunConfig::Execute,
             proof_sampling_number: 0,
-            enable_recovery: true,
             max_commitments_per_proof: None,
-            risc0_host: Risc0HostConfig::from_env().expect("Failed to load Risc0HostConfig"),
+            sp1_host: SP1HostConfig::from_env().expect("Failed to load SP1HostConfig"),
         }),
         None,
         rollup_config,
@@ -245,9 +244,8 @@ async fn test_batch_prover_prove_rpcs() {
             proving_mode: citrea_common::ProverGuestRunConfig::Execute,
             // Make it impossible for proving to happen
             proof_sampling_number: 1_000_000,
-            enable_recovery: true,
             max_commitments_per_proof: None,
-            risc0_host: Risc0HostConfig::from_env().expect("Failed to load Risc0HostConfig"),
+            sp1_host: SP1HostConfig::from_env().expect("Failed to load SP1HostConfig"),
         }),
         None,
         rollup_config,
@@ -347,6 +345,10 @@ async fn test_batch_prover_prove_rpcs() {
 
     // ensure that prover also syncs up to l2 block 6
     wait_for_l2_block(&prover_client, 6, None).await;
+    // all nodes in this process share the global short header proof provider, so the full node
+    // must finish executing blocks 5-6 before witness generation, or its queries get recorded
+    // as duplicate short header proofs in the prover's input
+    wait_for_l2_block(&full_node_client, 6, None).await;
     wait_for_prover_l1_height(&prover_client, 4, None)
         .await
         .unwrap();

@@ -118,7 +118,7 @@ Finally run this command to run your Citrea full node:
 
 Mac:
 ```sh
-./citrea-v2.3.1-osx-arm64 --network mainnet --da-layer bitcoin --rollup-config-path ./rollup_config.toml --genesis-paths ./genesis
+./citrea-v2.10.0-osx-arm64 --network mainnet --da-layer bitcoin --rollup-config-path ./rollup_config.toml --genesis-paths ./genesis
 ```
 
 or if you wish to use environment variables for configuring your node:
@@ -148,12 +148,12 @@ SYNC_BLOCKS_COUNT=10 \
 SCAN_L1_START_HEIGHT=924022 \
 RUST_LOG=info \
 JSON_LOGS=1 \
-./citrea-v2.3.1-osx-arm64 --network mainnet --da-layer bitcoin --genesis-paths ./genesis
+./citrea-v2.10.0-osx-arm64 --network mainnet --da-layer bitcoin --genesis-paths ./genesis
 ```
 
 Linux:
 ```sh
-./citrea-v2.3.1-linux-amd64 --network mainnet --da-layer bitcoin --rollup-config-path ./rollup_config.toml --genesis-paths ./genesis
+./citrea-v2.10.0-linux-amd64 --network mainnet --da-layer bitcoin --rollup-config-path ./rollup_config.toml --genesis-paths ./genesis
 ```
 
 or if you wish to use environment variables for configuring your node:
@@ -184,7 +184,7 @@ SYNC_BLOCKS_COUNT=10 \
 SCAN_L1_START_HEIGHT=924022 \
 RUST_LOG=info \
 JSON_LOGS=1 \
-./citrea-v2.3.1-linux-amd64 --network mainnet --da-layer bitcoin --genesis-paths ./genesis
+./citrea-v2.10.0-linux-amd64 --network mainnet --da-layer bitcoin --genesis-paths ./genesis
 ```
 
 Your full node should be serving RPC at `http://0.0.0.0:8080` now.
@@ -192,9 +192,13 @@ Your full node should be serving RPC at `http://0.0.0.0:8080` now.
 ### Option 2: Build from source
 
 
-#### Step 2.1: Install Rust
+#### Step 2.1: Install prerequisites
 
-If you don't have it, install it from [here](https://www.rust-lang.org/tools/install).
+If you don't have Rust, install it from [here](https://www.rust-lang.org/tools/install).
+
+Install the Protocol Buffers compiler (`protoc`) and ensure it is available on your `PATH`. On Ubuntu/Debian, run `sudo apt-get install protobuf-compiler`; on macOS, run `brew install protobuf`. Verify the installation with `protoc --version`.
+
+`protoc` is required by the SP1 SDK dependency even when building with `SKIP_GUEST_BUILD=1`.
 
 
 #### Step 2.2: Clone the source code

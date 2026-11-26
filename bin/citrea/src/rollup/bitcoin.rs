@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bitcoin_da::fee::FeeService;
+use bitcoin_da::helpers::builders::da_public_key;
 use bitcoin_da::monitoring::MonitoringService;
 use bitcoin_da::network_constants::get_network_constants;
 use bitcoin_da::rpc::create_rpc_module as create_da_rpc_module;
@@ -14,13 +15,12 @@ use bitcoin_da::spec::{BitcoinSpec, RollupParams};
 use bitcoin_da::verifier::BitcoinVerifier;
 use bitcoincore_rpc::{Auth, Client};
 use citrea_common::backup::{create_backup_rpc_module, BackupManager};
-use citrea_common::config::risc0::Risc0HostConfig;
+use citrea_common::config::sp1::SP1HostConfig;
 use citrea_common::config::ProverGuestRunConfig;
 use citrea_common::{FullNodeConfig, NodeType, RpcConfig};
 use citrea_primitives::forks::use_network_forks;
 use citrea_primitives::REVEAL_TX_PREFIX;
-use citrea_risc0_adapter::host::Risc0Host;
-// use citrea_sp1::host::SP1Host;
+use citrea_sp1::host::SP1Host;
 use citrea_stf::genesis_config::StorageConfig;
 use citrea_stf::runtime::CitreaRuntime;
 use jsonrpsee::RpcModule;
@@ -39,8 +39,8 @@ use tracing::instrument;
 
 use crate::guests::{
     BATCH_PROOF_DEVNET_GUESTS, BATCH_PROOF_LATEST_BITCOIN_GUESTS, BATCH_PROOF_MAINNET_GUESTS,
-    BATCH_PROOF_REGTEST_BITCOIN_GUESTS, BATCH_PROOF_TESTNET_GUESTS, LIGHT_CLIENT_DEVNET_GUESTS,
-    LIGHT_CLIENT_LATEST_BITCOIN_GUESTS, LIGHT_CLIENT_MAINNET_GUESTS, LIGHT_CLIENT_TESTNET_GUESTS,
+    BATCH_PROOF_TESTNET_GUESTS, LIGHT_CLIENT_DEVNET_GUESTS, LIGHT_CLIENT_LATEST_BITCOIN_GUESTS,
+    LIGHT_CLIENT_MAINNET_GUESTS, LIGHT_CLIENT_TESTNET_GUESTS,
 };
 use crate::{CitreaRollupBlueprint, Network};
 
@@ -57,7 +57,7 @@ impl RollupBlueprint for BitcoinRollup {
     type DaSpec = BitcoinSpec;
     type DaConfig = BitcoinServiceConfig;
     type DaVerifier = BitcoinVerifier;
-    type Vm = Risc0Host;
+    type Vm = SP1Host;
 
     fn new(network: Network) -> Self {
         use_network_forks(network);
@@ -149,10 +149,15 @@ impl RollupBlueprint for BitcoinRollup {
 
         let network = network_to_bitcoin_network(&chain_params.network);
         let network_constants = get_network_constants(&network);
+        let expected_da_public_key = da_config
+            .parse_da_private_key()?
+            .as_ref()
+            .map(da_public_key);
         let (monitoring_service, block_rx) = MonitoringService::new(
             client.clone(),
             da_config.monitoring.clone(),
             network_constants.finality_depth,
+            expected_da_public_key,
         );
         let monitoring_service = Arc::new(monitoring_service);
 
@@ -208,10 +213,6 @@ impl RollupBlueprint for BitcoinRollup {
                 .iter()
                 .map(|(k, (_, code))| (*k, code.clone()))
                 .collect(),
-            Network::TestNetworkWithForks => BATCH_PROOF_REGTEST_BITCOIN_GUESTS
-                .iter()
-                .map(|(k, (_, code))| (*k, code.clone()))
-                .collect(),
         }
     }
 
@@ -229,7 +230,7 @@ impl RollupBlueprint for BitcoinRollup {
                 .iter()
                 .map(|(k, (_, code))| (*k, code.clone()))
                 .collect(),
-            Network::Nightly | Network::TestNetworkWithForks => LIGHT_CLIENT_LATEST_BITCOIN_GUESTS
+            Network::Nightly => LIGHT_CLIENT_LATEST_BITCOIN_GUESTS
                 .iter()
                 .map(|(k, (_, code))| (*k, code.clone()))
                 .collect(),
@@ -256,10 +257,6 @@ impl RollupBlueprint for BitcoinRollup {
                 .iter()
                 .map(|(k, (id, _))| (*k, *id))
                 .collect(),
-            Network::TestNetworkWithForks => BATCH_PROOF_REGTEST_BITCOIN_GUESTS
-                .iter()
-                .map(|(k, (id, _))| (*k, *id))
-                .collect(),
         }
     }
 
@@ -279,7 +276,7 @@ impl RollupBlueprint for BitcoinRollup {
                 .iter()
                 .map(|(k, (id, _))| (*k, *id))
                 .collect(),
-            Network::Nightly | Network::TestNetworkWithForks => LIGHT_CLIENT_LATEST_BITCOIN_GUESTS
+            Network::Nightly => LIGHT_CLIENT_LATEST_BITCOIN_GUESTS
                 .iter()
                 .map(|(k, (id, _))| (*k, *id))
                 .collect(),
@@ -290,17 +287,14 @@ impl RollupBlueprint for BitcoinRollup {
     async fn create_prover_service(
         &self,
         proving_mode: ProverGuestRunConfig,
-        risc0_host_config: Risc0HostConfig,
+        sp1_host_config: SP1HostConfig,
         da_service: &Arc<Self::DaService>,
-        ledger_db: LedgerDB,
         proof_sampling_number: usize,
         is_light_client_prover: bool,
     ) -> ParallelProverService<Self::DaService, Self::Vm> {
-        let vm = Risc0Host::new(ledger_db.clone(), self.network, risc0_host_config).await;
-        // let vm = SP1Host::new(
-        //     include_bytes!("../guests/sp1/batch-prover-bitcoin/elf/zkvm-elf"),
-        //     ledger_db.clone(),
-        // );
+        let vm = SP1Host::new(self.network, sp1_host_config);
+        vm.require_network_proving(proving_mode, proof_sampling_number)
+            .await;
 
         let proof_mode = match proving_mode {
             ProverGuestRunConfig::Skip => ProofGenMode::Skip,

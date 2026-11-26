@@ -7,7 +7,7 @@ use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_rpc_types::{SyncInfo, SyncStatus as EthSyncStatus, Transaction};
 use alloy_rpc_types_txpool::TxpoolContent;
 use citrea_common::rpc::utils::internal_rpc_error;
-use citrea_evm::Evm;
+use citrea_evm::{Evm, RpcGasCap};
 use citrea_stf::runtime::DefaultContext;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
@@ -19,7 +19,7 @@ use reth_rpc_types_compat::TransactionCompat;
 use reth_transaction_pool::{
     AllPoolTransactions, EthPooledTransaction, PoolTransaction, ValidPoolTransaction,
 };
-use sov_db::ledger_db::{LedgerDB, SequencerLedgerOps, SharedLedgerOps};
+use sov_db::ledger_db::{LedgerDB, SharedLedgerOps};
 use sov_modules_api::{Spec, WorkingSet};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error};
@@ -150,6 +150,22 @@ pub trait SequencerRpc {
     #[blocking]
     fn send_raw_deposit_transaction(&self, deposit: Bytes) -> RpcResult<()>;
 
+    /// Retrieves the raw EIP-2718 encoded transaction by hash
+    ///
+    /// Same lookup logic as `eth_getTransactionByHash` but returns the EIP-2718
+    /// encoded transaction bytes instead of the parsed transaction object.
+    ///
+    /// # Arguments
+    /// * `hash` - The transaction hash
+    /// * `mempool_only` - If true, only check the mempool. Default is false.
+    #[method(name = "eth_getRawTransactionByHash")]
+    #[blocking]
+    fn eth_get_raw_transaction_by_hash(
+        &self,
+        hash: B256,
+        mempool_only: Option<bool>,
+    ) -> RpcResult<Option<Bytes>>;
+
     /// Forces block production in test mode
     ///
     /// This method is only available when the sequencer is running in test mode.
@@ -209,10 +225,8 @@ impl SequencerRpcServer for SequencerRpcServerImpl {
     async fn eth_send_raw_transaction(&self, data: Bytes) -> RpcResult<B256> {
         debug!("Sequencer: eth_sendRawTransaction");
 
-        let recovered = recover_raw_transaction(data.clone())?;
+        let recovered = recover_raw_transaction(data)?;
         let pool_transaction = EthPooledTransaction::from_pooled(recovered);
-
-        let rlp_encoded_tx = pool_transaction.transaction().inner().encoded_2718();
 
         let hash = self
             .context
@@ -220,15 +234,6 @@ impl SequencerRpcServer for SequencerRpcServerImpl {
             .add_external_transaction(pool_transaction)
             .await
             .map_err(EthApiError::from)?;
-
-        // Do not return error here just log
-        if let Err(e) = self
-            .context
-            .ledger
-            .insert_mempool_tx(hash.to_vec(), rlp_encoded_tx)
-        {
-            tracing::warn!("Failed to insert mempool tx into db: {:?}", e);
-        }
 
         Ok(hash)
     }
@@ -279,6 +284,37 @@ impl SequencerRpcServer for SequencerRpcServerImpl {
         }
     }
 
+    fn eth_get_raw_transaction_by_hash(
+        &self,
+        hash: B256,
+        mempool_only: Option<bool>,
+    ) -> RpcResult<Option<Bytes>> {
+        debug!(
+            "Sequencer: eth_getRawTransactionByHash({}, {:?})",
+            hash, mempool_only
+        );
+
+        match self.context.mempool.get(&hash) {
+            Some(tx) => {
+                let raw = tx.to_consensus().encoded_2718();
+                Ok(Some(raw.into()))
+            }
+            None => match mempool_only {
+                Some(true) => Ok(None),
+                _ => {
+                    let evm = Evm::<DefaultContext>::default();
+                    let mut working_set = WorkingSet::new(self.context.storage.clone());
+
+                    match evm.get_transaction_by_hash(hash, &mut working_set) {
+                        Ok(Some(tx)) => Ok(Some(tx.as_recovered().encoded_2718().into())),
+                        Ok(None) => Ok(None),
+                        Err(e) => Err(e),
+                    }
+                }
+            },
+        }
+    }
+
     /// eth_sendRawDepositTransaction RPC call implementation
     fn send_raw_deposit_transaction(&self, deposit: Bytes) -> RpcResult<()> {
         debug!("Sequencer: citrea_sendRawDepositTransaction");
@@ -296,13 +332,17 @@ impl SequencerRpcServer for SequencerRpcServerImpl {
             .make_deposit_tx_from_data(deposit.clone().into());
 
         let start = std::time::Instant::now();
-        let tx_res = evm.get_call(
+        let tx_res = evm.get_call_with_gas_cap(
             dep_tx,
             Some(BlockId::pending()),
             None,
             None,
             &mut working_set,
             &self.context.ledger,
+            // Deposit validation is not `eth_call`/`debug_traceCall`, so the configurable RPC gas
+            // cap must not apply: a cap below the 1M system deposit gas limit would reject valid
+            // deposits. `new(0)` keeps the block-gas-limit ceiling these transactions expect.
+            RpcGasCap::new(0),
         );
         let deposit_tx_call_duration = Instant::now()
             .saturating_duration_since(start)

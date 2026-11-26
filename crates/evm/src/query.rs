@@ -5,6 +5,7 @@ use alloy_consensus::{
     Block as AlloyConsensusBlock, BlockBody, Header as AlloyConsensusHeader,
     Transaction as AlloyTransaction, TxReceipt, EMPTY_OMMER_ROOT_HASH,
 };
+use alloy_eips::eip2718::Encodable2718;
 use alloy_eips::eip2930::AccessListWithGasUsed;
 use alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
 use alloy_eips::{BlockId, BlockNumHash, BlockNumberOrTag};
@@ -65,7 +66,7 @@ use crate::evm::primitive_types::{
 use crate::handler::{diff_size_send_eth_eoa, TxInfo};
 use crate::rpc_helpers::*;
 use crate::AccountData;
-use crate::{citrea_spec_id_to_evm_spec_id, BlockStorageDiff, Evm, EvmChainConfig};
+use crate::{citrea_spec_id_to_evm_spec_id, BlockStorageDiff, Evm, EvmChainConfig, RpcGasCap};
 /// Gas per transaction not creating a contract.
 pub const MIN_TRANSACTION_GAS: u64 = 21_000u64;
 
@@ -80,7 +81,7 @@ const ESTIMATE_GAS_ERROR_RATIO: f64 = 0.015;
 /// This is very useful for users to test their balance after calling to `eth_estimateGas`
 /// whether they can afford to execute a transaction.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub(crate) struct EstimatedTxExpenses {
+pub struct EstimatedTxExpenses {
     /// Evm gas used.
     pub gas_used: U64,
     /// Gas limit of the block used for simulation.
@@ -99,6 +100,11 @@ impl EstimatedTxExpenses {
         // Actually not an L1 fee but l1_fee / base_fee.
         let l1_fee_overhead = U256::from(1).max(self.l1_fee.div_ceil(self.base_fee));
         l1_fee_overhead + U256::from(self.gas_used)
+    }
+
+    /// The L1 data-availability fee the transaction is expected to owe post-execution.
+    pub fn l1_fee(&self) -> U256 {
+        self.l1_fee
     }
 }
 
@@ -503,6 +509,41 @@ impl<C: sov_modules_api::Context> Evm<C> {
         Ok(Some(transaction))
     }
 
+    /// Handler for: `eth_getRawTransactionByBlockHashAndIndex`
+    #[rpc_method(name = "eth_getRawTransactionByBlockHashAndIndex")]
+    pub fn get_raw_transaction_by_block_hash_and_index(
+        &self,
+        block_hash: B256,
+        index: U64,
+        working_set: &mut WorkingSet<C::Storage>,
+    ) -> RpcResult<Option<Bytes>> {
+        let mut accessory_state = working_set.accessory_state();
+
+        let block_number = match self.block_hashes.get(&block_hash, &mut accessory_state) {
+            Some(block_number) => block_number,
+            None => return Ok(None),
+        };
+
+        let block = self
+            .blocks
+            .get(block_number as usize, &mut accessory_state)
+            .expect("Block must be set");
+
+        match check_tx_range(&block.transactions, index) {
+            Some(_) => (),
+            None => return Ok(None),
+        }
+
+        let tx_number = block.transactions.start + index.to::<u64>();
+
+        let tx = self
+            .transactions
+            .get(tx_number as usize, &mut accessory_state)
+            .expect("Transaction must be set");
+
+        Ok(Some(tx.signed_transaction.encoded_2718().into()))
+    }
+
     /// Handler for: `eth_getTransactionByBlockNumberAndIndex`
     #[rpc_method(name = "eth_getTransactionByBlockNumberAndIndex")]
     pub fn get_transaction_by_block_number_and_index(
@@ -551,6 +592,37 @@ impl<C: sov_modules_api::Context> Evm<C> {
         Ok(Some(transaction))
     }
 
+    /// Handler for: `eth_getRawTransactionByBlockNumberAndIndex`
+    #[rpc_method(name = "eth_getRawTransactionByBlockNumberAndIndex")]
+    pub fn get_raw_transaction_by_block_number_and_index(
+        &self,
+        block_number: BlockNumberOrTag,
+        index: U64,
+        working_set: &mut WorkingSet<C::Storage>,
+        ledger_db: &crate::LedgerDB,
+    ) -> RpcResult<Option<Bytes>> {
+        let block =
+            match self.get_sealed_block_by_number(Some(block_number), working_set, ledger_db) {
+                Ok(Some(block)) => block,
+                Ok(None) => return Ok(None),
+                Err(err) => return Err(err.into()),
+            };
+
+        match check_tx_range(&block.transactions, index) {
+            Some(_) => (),
+            None => return Ok(None),
+        }
+
+        let tx_number = block.transactions.start + index.to::<u64>();
+
+        let tx = self
+            .transactions
+            .get(tx_number as usize, &mut working_set.accessory_state())
+            .expect("Transaction must be set");
+
+        Ok(Some(tx.signed_transaction.encoded_2718().into()))
+    }
+
     /// Handler for: `eth_getTransactionReceipt`
     #[rpc_method(name = "eth_getTransactionReceipt")]
     pub fn get_transaction_receipt(
@@ -583,11 +655,11 @@ impl<C: sov_modules_api::Context> Evm<C> {
         Ok(receipt)
     }
 
-    /// Handler for: `eth_call`
+    /// Handler for: `eth_call`, bounded by the server's RPC gas cap.
     //https://github.com/paradigmxyz/reth/blob/f577e147807a783438a3f16aad968b4396274483/crates/rpc/rpc/src/eth/api/transactions.rs#L502
     //https://github.com/paradigmxyz/reth/blob/main/crates/rpc/rpc-types/src/eth/call.rs#L7
-    #[rpc_method(name = "eth_call", blocking)]
-    pub fn get_call(
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_call_with_gas_cap(
         &self,
         request: TransactionRequest,
         block_id: Option<BlockId>,
@@ -595,8 +667,9 @@ impl<C: sov_modules_api::Context> Evm<C> {
         block_overrides: Option<BlockOverrides>,
         working_set: &mut WorkingSet<C::Storage>,
         ledger_db: &crate::LedgerDB,
+        gas_cap: RpcGasCap,
     ) -> RpcResult<Bytes> {
-        self.get_call_inner(
+        self.get_call_inner_with_gas_cap(
             request,
             block_id,
             state_overrides,
@@ -604,9 +677,11 @@ impl<C: sov_modules_api::Context> Evm<C> {
             working_set,
             ledger_db,
             fork_from_block_number,
+            gas_cap,
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn get_call_inner(
         &self,
@@ -617,6 +692,30 @@ impl<C: sov_modules_api::Context> Evm<C> {
         working_set: &mut WorkingSet<C::Storage>,
         ledger_db: &crate::LedgerDB,
         fork_fn: impl Fn(u64) -> Fork,
+    ) -> RpcResult<Bytes> {
+        self.get_call_inner_with_gas_cap(
+            request,
+            block_id,
+            state_overrides,
+            block_overrides,
+            working_set,
+            ledger_db,
+            fork_fn,
+            RpcGasCap::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn get_call_inner_with_gas_cap(
+        &self,
+        request: TransactionRequest,
+        block_id: Option<BlockId>,
+        state_overrides: Option<StateOverride>,
+        block_overrides: Option<BlockOverrides>,
+        working_set: &mut WorkingSet<C::Storage>,
+        ledger_db: &crate::LedgerDB,
+        fork_fn: impl Fn(u64) -> Fork,
+        gas_cap: RpcGasCap,
     ) -> RpcResult<Bytes> {
         let block_number = match block_id {
             Some(BlockId::Number(block_num)) => block_num,
@@ -662,6 +761,11 @@ impl<C: sov_modules_api::Context> Evm<C> {
 
         let mut evm_db = self.get_db(working_set, citrea_spec_id);
 
+        // The RPC gas cap bounds the transaction gas (in `create_txn_env`), letting a read-only
+        // call run above the real block gas limit up to the cap. `block_env.gas_limit` is left as
+        // the real block gas limit so the `GASLIMIT` opcode still reports the chain's value.
+        let gas_cap = gas_cap.get();
+
         if let Some(mut block_overrides) = block_overrides {
             apply_block_overrides(&mut block_env, &mut block_overrides, &mut evm_db);
         }
@@ -684,15 +788,11 @@ impl<C: sov_modules_api::Context> Evm<C> {
             cap_to_balance,
             nonce,
             chain_id,
+            gas_cap,
         )?;
 
-        let result = match inspect_with_citrea_handler(
-            evm_db,
-            cfg_env,
-            block_env,
-            tx_env,
-            /* l1_fee_rate */ 0,
-            TracingInspector::new(TracingInspectorConfig::none()),
+        let result = match execute_with_citrea_handler(
+            evm_db, cfg_env, block_env, tx_env, /* l1_fee_rate */ 0,
         ) {
             Ok((result, _)) => result.result,
             Err(err) => {
@@ -812,6 +912,8 @@ impl<C: sov_modules_api::Context> Evm<C> {
             Some(account.balance),
             nonce,
             chain_id,
+            // eth_createAccessList stays bounded by the block gas limit, not the RPC gas cap
+            0,
         )?;
 
         // can consume the list since we're not using the request anymore
@@ -893,12 +995,19 @@ impl<C: sov_modules_api::Context> Evm<C> {
                 )
             }
         };
+        // Set evm state to block if needed
+        let block_num = block_env.number;
+        match block_number {
+            None | Some(BlockNumberOrTag::Pending | BlockNumberOrTag::Latest) => {}
+            _ => set_state_to_end_of_evm_block::<C>(block_num, working_set),
+        };
+
         let cfg = self
             .cfg
             .get(working_set)
             .expect("EVM chain config should be set");
 
-        let citrea_spec_id = fork_fn(block_env.number).spec_id;
+        let citrea_spec_id = fork_fn(block_num).spec_id;
         let evm_spec_id = citrea_spec_id_to_evm_spec_id(citrea_spec_id);
 
         let cfg_env = get_cfg_env(cfg, evm_spec_id);
@@ -963,12 +1072,14 @@ impl<C: sov_modules_api::Context> Evm<C> {
         &self,
         request: TransactionRequest,
         block_number: Option<BlockNumberOrTag>,
+        state_overrides: Option<StateOverride>,
         working_set: &mut WorkingSet<C::Storage>,
         ledger_db: &crate::LedgerDB,
     ) -> RpcResult<EstimatedDiffSize> {
         self.eth_estimate_diff_size_inner(
             request,
             block_number,
+            state_overrides,
             working_set,
             ledger_db,
             fork_from_block_number,
@@ -979,6 +1090,7 @@ impl<C: sov_modules_api::Context> Evm<C> {
         &self,
         request: TransactionRequest,
         block_number: Option<BlockNumberOrTag>,
+        state_overrides: Option<StateOverride>,
         working_set: &mut WorkingSet<C::Storage>,
         ledger_db: &crate::LedgerDB,
         fork_fn: impl Fn(u64) -> Fork,
@@ -986,7 +1098,7 @@ impl<C: sov_modules_api::Context> Evm<C> {
         let estimated = self.estimate_tx_expenses(
             request,
             block_number,
-            None,
+            state_overrides,
             working_set,
             ledger_db,
             fork_fn,
@@ -1084,9 +1196,15 @@ impl<C: sov_modules_api::Context> Evm<C> {
         let nonce = request.nonce.unwrap_or(account.nonce);
         let chain_id = cfg_env.chain_id();
 
-        // create tx env
-        let mut tx_env =
-            create_txn_env(&block_env, request, Some(account.balance), nonce, chain_id)?;
+        // create tx env; eth_estimateGas stays bounded by the block gas limit, not the RPC gas cap
+        let mut tx_env = create_txn_env(
+            &block_env,
+            request,
+            Some(account.balance),
+            nonce,
+            chain_id,
+            0,
+        )?;
 
         // if the request is a simple transfer we can optimize
         if tx_env.data.is_empty() {
@@ -1108,13 +1226,12 @@ impl<C: sov_modules_api::Context> Evm<C> {
                     let mut inspect_tx_env = tx_env.clone();
                     inspect_tx_env.gas_limit = MIN_TRANSACTION_GAS;
 
-                    let res = inspect_with_citrea_handler(
+                    let res = execute_with_citrea_handler(
                         evm_db,
                         cfg_env.clone(),
                         block_env.clone(),
                         inspect_tx_env.clone(),
                         inspect_l1_fee_rate,
-                        TracingInspector::new(TracingInspectorConfig::none()),
                     );
 
                     if let Ok((res, tx_info)) = res {
@@ -1160,13 +1277,12 @@ impl<C: sov_modules_api::Context> Evm<C> {
         tx_env.gas_limit = std::cmp::min(tx_env.gas_limit, highest_gas_limit); // highest_gas_limit is capped to u64::MAX
 
         // execute the call without writing to db
-        let result = inspect_with_citrea_handler(
+        let result = execute_with_citrea_handler(
             evm_db,
             cfg_env.clone(),
             block_env.clone(),
             tx_env.clone(),
             inspect_l1_fee_rate,
-            TracingInspector::new(TracingInspectorConfig::none()),
         );
 
         // Exceptional case: init used too much gas, we need to increase the gas limit and try
@@ -1264,13 +1380,12 @@ impl<C: sov_modules_api::Context> Evm<C> {
             if let Some(ref state_overrides) = state_overrides {
                 apply_state_overrides(state_overrides.clone(), &mut evm_db)?;
             }
-            let curr_result = inspect_with_citrea_handler(
+            let curr_result = execute_with_citrea_handler(
                 evm_db,
                 cfg_env.clone(),
                 block_env.clone(),
                 tx_env.clone(),
                 inspect_l1_fee_rate,
-                TracingInspector::new(TracingInspectorConfig::none()),
             );
             let (curr_result, tx_info) = match curr_result {
                 Ok(result) => result,
@@ -1311,13 +1426,12 @@ impl<C: sov_modules_api::Context> Evm<C> {
             if let Some(ref state_overrides) = state_overrides {
                 apply_state_overrides(state_overrides.clone(), &mut evm_db)?;
             }
-            let result = inspect_with_citrea_handler(
+            let result = execute_with_citrea_handler(
                 evm_db,
                 cfg_env.clone(),
                 block_env.clone(),
                 tx_env.clone(),
                 inspect_l1_fee_rate,
-                TracingInspector::new(TracingInspectorConfig::none()),
             );
 
             // Exceptional case: init used too much gas, we need to increase the gas limit and try
@@ -1422,6 +1536,7 @@ impl<C: sov_modules_api::Context> Evm<C> {
     }
 
     /// Traces the entire block txs and returns the traces
+    #[allow(clippy::too_many_arguments)]
     pub fn trace_block_transactions_by_number(
         &self,
         block_number: u64,
@@ -1430,6 +1545,7 @@ impl<C: sov_modules_api::Context> Evm<C> {
         working_set: &mut WorkingSet<C::Storage>,
         ledger_db: &crate::LedgerDB,
         fork_fn: impl Fn(u64) -> Fork,
+        memory_limit_mb: u64,
     ) -> RpcResult<Vec<TraceResult>> {
         let sealed_block = self
             .get_sealed_block_by_number(
@@ -1453,8 +1569,12 @@ impl<C: sov_modules_api::Context> Evm<C> {
             })
             .collect();
 
+        let parent_block_number = block_number - 1;
         // set state to end of the previous block
-        set_state_to_end_of_evm_block::<C>(block_number - 1, working_set);
+        set_state_to_end_of_evm_block::<C>(parent_block_number, working_set);
+        // the begin hook of this block sets the parent hash, which the end-of-previous-block state lacks
+        let parent_block_hash = &sealed_block.header.parent_hash;
+        self.blockhash_set(parent_block_number, parent_block_hash, working_set);
 
         let citrea_spec_id = fork_fn(block_number).spec_id;
         let evm_spec_id = citrea_spec_id_to_evm_spec_id(citrea_spec_id);
@@ -1468,32 +1588,60 @@ impl<C: sov_modules_api::Context> Evm<C> {
         let cfg_env = get_cfg_env(cfg, evm_spec_id);
         let l1_fee_rate = sealed_block.l1_fee_rate;
 
-        let mut evm_db = self.get_db(working_set, citrea_spec_id);
+        // One budget for the whole request. When the request wants the whole block (`stop_at` is
+        // `None`) every transaction is traced and the traces are retained together until the
+        // response is built, so the budget is shared across them. When the request wants a single
+        // transaction (`stop_at` is `Some`) only that transaction is traced; the transactions
+        // before it are executed to advance state, not traced, so they cost nothing against the
+        // budget. Tracing the prefix would charge the target's budget for traces that are thrown
+        // away, and could make a late transaction in a busy block permanently untraceable.
+        let usage = TraceMemoryUsage::new(memory_limit_mb);
 
         // TODO: Convert below steps to blocking task like in reth after implementing the semaphores
         let mut traces = Vec::new();
         let mut transactions = block_txs.into_iter().enumerate().peekable();
-        let limit = stop_at.unwrap_or(usize::MAX);
+        let target = stop_at.unwrap_or(usize::MAX);
         while let Some((index, tx)) = transactions.next() {
-            let (trace, state_changes) = trace_transaction(
-                opts.clone().unwrap_or_default(),
-                cfg_env.clone(),
-                block_env.clone(),
-                create_tx_env(&tx),
-                tx.hash(),
-                &mut evm_db,
-                l1_fee_rate,
-            )?;
-            traces.push(TraceResult::new_success(trace, Some(*tx.hash())));
+            // Trace every transaction for a whole-block request, otherwise only the requested one.
+            let trace_this = stop_at.is_none() || index == target;
 
-            if limit == index {
+            let state_changes = if trace_this {
+                let mut evm_db = self.get_db(working_set, citrea_spec_id);
+                let (trace, state_changes) = trace_transaction(
+                    opts.clone().unwrap_or_default(),
+                    cfg_env.clone(),
+                    block_env.clone(),
+                    create_tx_env(&tx),
+                    tx.hash(),
+                    &mut evm_db,
+                    l1_fee_rate,
+                    &usage,
+                )?;
+                traces.push(TraceResult::new_success(trace, Some(*tx.hash())));
+                state_changes
+            } else {
+                // Execute without an inspector: this transaction is only a step toward the state
+                // the requested transaction runs against, and its trace is never returned.
+                let evm_db = self.get_db(working_set, citrea_spec_id);
+                let (result_and_state, _tx_info) = execute_with_citrea_handler(
+                    evm_db,
+                    cfg_env.clone(),
+                    block_env.clone(),
+                    create_tx_env(&tx),
+                    l1_fee_rate,
+                )
+                .map_err(EthApiError::from)?;
+                result_and_state.state
+            };
+
+            if index == target {
                 break;
             }
 
             if transactions.peek().is_some() {
-                // need to apply the state changes of this transaction before executing the
-                // next transaction
-                evm_db.commit(state_changes)
+                // apply this transaction's state changes before running the next one
+                let mut evm_db = self.get_db(working_set, citrea_spec_id);
+                evm_db.commit(state_changes);
             }
         }
         Ok(traces)
@@ -1609,6 +1757,8 @@ impl<C: sov_modules_api::Context> Evm<C> {
         let log_index = std::cell::RefCell::new(0usize);
         let mut state_diff_builder = BlockStorageDiffBuilder::default();
         let mut storage_contracts = std::collections::BTreeSet::new();
+        // trace_debankBlock is not bounded by the debug_trace* memory limit.
+        let usage = TraceMemoryUsage::new(0);
 
         for (index, tx) in transactions.iter().enumerate() {
             let mut inspector = TracingInspector::new(
@@ -1620,6 +1770,7 @@ impl<C: sov_modules_api::Context> Evm<C> {
             inspector.config_mut().record_opcodes_filter =
                 Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
 
+            let budget = TraceMemoryBudget::steps(&usage, inspector.config());
             let recovered_tx: Recovered<TransactionSigned> = tx.clone().into();
             let result = trace_citrea(
                 &mut evm_db,
@@ -1629,6 +1780,7 @@ impl<C: sov_modules_api::Context> Evm<C> {
                 Some(tx.signed_transaction.hash()),
                 l1_fee_rate,
                 &mut inspector,
+                budget,
             )
             .map_err(|e| EthApiError::EvmCustom(e.to_string()))?;
 
@@ -1665,8 +1817,9 @@ impl<C: sov_modules_api::Context> Evm<C> {
         })
     }
 
-    /// Returns the trace of a call
-    /// Returns trace for given tx request call.
+    /// [`Self::debug_trace_call_with_gas_cap`] with the default gas cap. Test-only, so production
+    /// code cannot bypass the server's configured cap.
+    #[cfg(test)]
     pub fn debug_trace_call(
         &self,
         request: TransactionRequest,
@@ -1674,6 +1827,30 @@ impl<C: sov_modules_api::Context> Evm<C> {
         opts: Option<GethDebugTracingCallOptions>,
         working_set: &mut WorkingSet<C::Storage>,
         ledger_db: &crate::LedgerDB,
+        memory_limit_mb: u64,
+    ) -> RpcResult<GethTrace> {
+        self.debug_trace_call_with_gas_cap(
+            request,
+            block_id,
+            opts,
+            working_set,
+            ledger_db,
+            memory_limit_mb,
+            RpcGasCap::default(),
+        )
+    }
+
+    /// Handler for `debug_traceCall`, bounded by the server's RPC gas cap.
+    #[allow(clippy::too_many_arguments)]
+    pub fn debug_trace_call_with_gas_cap(
+        &self,
+        request: TransactionRequest,
+        block_id: Option<BlockId>,
+        opts: Option<GethDebugTracingCallOptions>,
+        working_set: &mut WorkingSet<C::Storage>,
+        ledger_db: &crate::LedgerDB,
+        memory_limit_mb: u64,
+        gas_cap: RpcGasCap,
     ) -> RpcResult<GethTrace> {
         let block_number = match block_id {
             Some(BlockId::Number(block_num)) => block_num,
@@ -1741,6 +1918,11 @@ impl<C: sov_modules_api::Context> Evm<C> {
             apply_state_overrides(state_overrides, &mut evm_db)?;
         }
 
+        // The RPC gas cap bounds the transaction gas (in `create_txn_env`), letting a read-only
+        // call run above the real block gas limit up to the cap. `block_env.gas_limit` is left as
+        // the real block gas limit so the `GASLIMIT` opcode still reports the chain's value.
+        let gas_cap = gas_cap.get();
+
         if let Some(mut block_overrides) = block_overrides {
             apply_block_overrides(&mut block_env, &mut block_overrides, &mut evm_db);
         }
@@ -1762,6 +1944,7 @@ impl<C: sov_modules_api::Context> Evm<C> {
             account.balance,
             nonce,
             chain_id,
+            gas_cap,
         )?;
         let trace = trace_call(
             tracing_options,
@@ -1770,6 +1953,7 @@ impl<C: sov_modules_api::Context> Evm<C> {
             tx_env,
             &mut evm_db,
             l1_fee_rate,
+            &TraceMemoryUsage::new(memory_limit_mb),
         )?;
         Ok(trace)
     }
@@ -1826,8 +2010,13 @@ impl<C: sov_modules_api::Context> Evm<C> {
                     .map(|num| convert_block_number(num, start_block))
                     .transpose()?
                     .flatten();
+
+                if matches!((from, to), (Some(from), Some(to)) if to < from) {
+                    return Err(EthFilterError::InvalidBlockRangeParams);
+                }
+
                 let (from_block_number, to_block_number) =
-                    get_filter_block_range(from, to, start_block);
+                    get_filter_block_range(from, to, start_block, start_block);
                 self.get_logs_in_block_range(
                     working_set,
                     &filter,
@@ -1843,6 +2032,7 @@ impl<C: sov_modules_api::Context> Evm<C> {
     /// Returns all logs in the given _inclusive_ range that match the filter
     ///
     /// Returns an error if:
+    ///  - block range is invalid
     ///  - underlying database error
     ///  - amount of matches exceeds configured limit
     pub fn get_logs_in_block_range(
@@ -1853,6 +2043,10 @@ impl<C: sov_modules_api::Context> Evm<C> {
         to_block_number: u64,
         max_logs_per_response: usize,
     ) -> Result<Vec<Log>, EthFilterError> {
+        if to_block_number < from_block_number {
+            return Err(EthFilterError::InvalidBlockRangeParams);
+        }
+
         let max_blocks_per_filter: u64 = get_max_blocks_per_filter();
         if to_block_number - from_block_number >= max_blocks_per_filter {
             return Err(EthFilterError::QueryExceedsMaxBlocks(max_blocks_per_filter));
@@ -1916,6 +2110,7 @@ impl<C: sov_modules_api::Context> Evm<C> {
         let removed = false;
 
         let tx_range = block.transactions;
+        let first_tx = tx_range.start;
         let filter = FilteredParams::new(Some(filter));
         for i in tx_range {
             let receipt = self
@@ -1937,7 +2132,7 @@ impl<C: sov_modules_api::Context> Evm<C> {
                         block_number: Some(block.header.number),
                         block_timestamp: Some(block.header.timestamp),
                         transaction_hash: Some(*tx.signed_transaction.hash()),
-                        transaction_index: Some(i),
+                        transaction_index: Some(i - first_tx),
                         log_index: Some(log_index),
                         removed,
                     });
@@ -2289,14 +2484,7 @@ fn map_out_of_gas_err<C: sov_modules_api::Context>(
     let req_gas_limit = tx_env.gas_limit;
     tx_env.gas_limit = block_env.gas_limit;
 
-    match inspect_with_citrea_handler(
-        db,
-        cfg_env,
-        block_env,
-        tx_env,
-        inspect_l1_fee_rate,
-        TracingInspector::new(TracingInspectorConfig::none()),
-    ) {
+    match execute_with_citrea_handler(db, cfg_env, block_env, tx_env, inspect_l1_fee_rate) {
         Ok((res, _tx_info)) => match res.result {
             ExecutionResult::Success { .. } => {
                 // transaction succeeded by manually increasing the gas limit to
@@ -2372,6 +2560,83 @@ fn set_state_to_end_of_evm_block<C: sov_modules_api::Context>(
     // genesis is committed at db version 1
     // so every block is offset by 1
     working_set.set_archival_version(block_number + 1);
+}
+
+impl<C: sov_modules_api::Context> Evm<C> {
+    /// Prices the Citrea L1 data-availability fee a concrete, already-signed transaction is
+    /// expected to owe *post-execution*, by simulating it once against the pending (next) block.
+    ///
+    /// Unlike [`Evm::estimate_gas_with_env`], this performs a **single** execution at the
+    /// transaction's own gas limit — no gas binary search — because the caller already has a
+    /// concrete tx and only needs its diff-size/L1 fee. Intended for mempool admission, where
+    /// running the full gas search per incoming tx would be needlessly expensive.
+    ///
+    /// The inner execution runs with `l1_fee_rate = 0` so the [`CitreaHandler`](crate::handler)
+    /// never trips the "Not enough funds for L1 fee" error; `l1_diff_size` is rate-independent
+    /// (it is the *structure* of the state diff), so the real fee is recovered afterwards as
+    /// `next_block_l1_fee_rate * l1_diff_size`.
+    pub fn simulate_tx_l1_fee(
+        &self,
+        tx: &Recovered<TransactionSigned>,
+        working_set: &mut WorkingSet<C::Storage>,
+        fork_fn: impl Fn(u64) -> Fork,
+    ) -> Result<EstimatedTxExpenses, EthApiError> {
+        // Rate the block builder will price the next block with (last sealed block's rate).
+        // Guard explicitly instead of relying on the `.expect()` inside `get_pending_block_env`,
+        // as a panic here would take down the mempool validation task.
+        let l1_fee_rate = self
+            .blocks
+            .last(&mut working_set.accessory_state())
+            .ok_or(EthApiError::HeaderNotFound(BlockNumberOrTag::Latest.into()))?
+            .l1_fee_rate;
+
+        let block_env = get_pending_block_env(self, working_set);
+        let citrea_spec_id = fork_fn(block_env.number).spec_id;
+        let evm_spec_id = citrea_spec_id_to_evm_spec_id(citrea_spec_id);
+
+        let cfg = self
+            .cfg
+            .get(working_set)
+            .expect("EVM chain config should be set");
+        let mut cfg_env = get_cfg_env(cfg, evm_spec_id);
+        // The pool legitimately holds transactions that are not yet includable: below the
+        // current base fee (base-fee subpool) or with a future nonce (queued subpool). We only
+        // want the diff size, so relax these checks. Balance checks stay ON so the L2 spend
+        // semantics remain real (reth already guaranteed `balance >= cost()`).
+        cfg_env.disable_base_fee = true;
+        cfg_env.disable_nonce_check = true;
+        cfg_env.disable_eip3607 = true;
+
+        let mut tx_env = create_tx_env(tx);
+        // Never let the simulation claim more gas than a block can hold.
+        tx_env.gas_limit = tx_env.gas_limit.min(block_env.gas_limit);
+
+        // Capture block-derived fields before `block_env` is moved into the executor.
+        let base_fee = U256::from(block_env.basefee);
+        let block_gas_limit = U64::from(block_env.gas_limit);
+
+        let evm_db = self.get_db(working_set, citrea_spec_id);
+        let (result_and_state, tx_info) = inspect_with_citrea_handler(
+            evm_db,
+            cfg_env,
+            block_env,
+            tx_env,
+            0, // l1_fee_rate = 0; real fee recovered below
+            TracingInspector::new(TracingInspectorConfig::none()),
+        )
+        .map_err(EthApiError::from)?;
+
+        let l1_diff_size = tx_info.l1_diff_size;
+        let l1_fee = U256::from(l1_fee_rate).saturating_mul(U256::from(l1_diff_size));
+
+        Ok(EstimatedTxExpenses {
+            gas_used: U64::from(result_and_state.result.gas_used()),
+            block_gas_limit,
+            base_fee,
+            l1_fee,
+            l1_diff_size,
+        })
+    }
 }
 
 /// We add some kind of L1 fee overhead to the estimated gas

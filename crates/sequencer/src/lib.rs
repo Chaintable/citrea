@@ -50,7 +50,7 @@ use reth_tasks::TaskExecutor;
 use reth_transaction_pool::maintain::{maintain_transaction_pool_future, MaintainPoolConfig};
 pub use rpc::SequencerRpcClient;
 pub use runner::{CitreaSequencer, MAX_MISSED_DA_BLOCKS_PER_L2_BLOCK};
-use sov_db::ledger_db::LedgerDB;
+use sov_db::ledger_db::{LedgerDB, SharedLedgerOps};
 use sov_modules_stf_blueprint::StfBlueprint;
 use sov_prover_storage_manager::ProverStorageManager;
 use sov_rollup_interface::fork::ForkManager;
@@ -79,6 +79,8 @@ mod metrics;
 pub mod rpc;
 /// Module implementing the main sequencer running logic
 mod runner;
+/// Custom mempool transaction validator that reserves the Citrea L1 fee at admission
+mod tx_validator;
 /// Module for declaring types used by the sequencer
 mod types;
 /// Module containing utility functions and helpers
@@ -132,6 +134,7 @@ where
         db_provider.clone(),
         sequencer_config.mempool_conf.clone(),
         task_executor.clone(),
+        ledger_db.path().with_file_name("mempool.rlp"),
     )?);
     let deposit_mempool = Arc::new(Mutex::new(DepositDataMempool::new()));
 
