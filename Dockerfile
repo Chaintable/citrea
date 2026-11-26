@@ -1,4 +1,4 @@
-FROM rust:1.88.0-bookworm AS builder
+FROM rust:1.97-bookworm AS builder
 WORKDIR /app
 COPY . .
 RUN apt-get update -y && apt-get install -y libclang-dev protobuf-compiler
