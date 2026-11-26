@@ -31,6 +31,7 @@ pub fn register_ethereum<Da: DaService>(
             stale_filter_ttl: rpc_config.stale_filter_ttl,
             enable_filters: rpc_config.enable_filters,
             evm_genesis_path,
+            trace_cache_limit_mb: rpc_config.trace_cache_limit_mb,
         }
     };
 

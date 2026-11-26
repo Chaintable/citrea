@@ -2,15 +2,20 @@ mod ethereum;
 mod gas_price;
 mod subscription;
 mod trace;
+mod trace_cache;
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use alloy_network::eip2718::Encodable2718;
 use alloy_network::AnyTransactionReceipt;
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256, U64};
 use alloy_rpc_types::serde_helpers::JsonStorageKey;
+use alloy_rpc_types::state::StateOverride;
 use alloy_rpc_types::{
-    BlockId, BlockNumberOrTag, EIP1186AccountProofResponse, FeeHistory, Filter, FilterChanges,
-    FilterId, Index, Log, SyncInfo, SyncStatus as EthSyncStatus, Transaction, TransactionRequest,
+    BlockId, BlockNumberOrTag, BlockOverrides, EIP1186AccountProofResponse, FeeHistory, Filter,
+    FilterChanges, FilterId, Index, Log, SyncInfo, SyncStatus as EthSyncStatus, Transaction,
+    TransactionRequest,
 };
 use alloy_rpc_types_trace::geth::{
     GethDebugTracerType, GethDebugTracingCallOptions, GethDebugTracingOptions, GethTrace,
@@ -19,7 +24,9 @@ use alloy_rpc_types_trace::geth::{
 use citrea_common::rpc::eip_7966;
 use citrea_common::rpc::utils::internal_rpc_error;
 use citrea_common::RpcConfig;
-use citrea_evm::{generate_eth_proof, AccountData, DebankOutPut, Evm, EvmConfig, FilterKind};
+use citrea_evm::{
+    generate_eth_proof, AccountData, DebankOutPut, Evm, EvmConfig, FilterKind, RpcGasCap,
+};
 use citrea_primitives::forks::fork_from_block_number;
 use citrea_sequencer::SequencerRpcClient;
 use citrea_stf::genesis_config::read_json_file;
@@ -41,8 +48,12 @@ use sov_modules_api::WorkingSet;
 use sov_rollup_interface::services::da::DaService;
 use sov_state::storage::NativeStorage;
 use tokio::join;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Semaphore};
 use trace::{debug_trace_by_block_number, handle_debug_trace_chain};
+
+/// Maximum storage keys per `eth_getProof` request, matching Geth's `maxGetProofKeys`.
+/// Bounds storage reads, JMT proof generation, and response memory per request.
+const MAX_GET_PROOF_KEYS: usize = 1024;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -67,6 +78,16 @@ pub struct SyncStatus {
 
 #[rpc(server)]
 pub trait EthereumRpc {
+    #[method(name = "eth_call")]
+    #[blocking]
+    fn eth_call(
+        &self,
+        request: TransactionRequest,
+        block_id: Option<BlockId>,
+        state_overrides: Option<StateOverride>,
+        block_overrides: Option<BlockOverrides>,
+    ) -> RpcResult<Bytes>;
+
     /// Returns the client version.
     #[method(name = "web3_clientVersion")]
     fn web3_client_version(&self) -> RpcResult<String>;
@@ -102,6 +123,7 @@ pub trait EthereumRpc {
     ) -> RpcResult<FeeHistory>;
 
     /// Returns zkproof by EIP-1186.
+    /// At most 1024 storage keys may be requested.
     #[method(name = "eth_getProof")]
     #[blocking]
     fn eth_get_proof(
@@ -113,8 +135,7 @@ pub trait EthereumRpc {
 
     /// Returns traces for a block by hash.
     #[method(name = "debug_traceBlockByHash")]
-    #[blocking]
-    fn debug_trace_block_by_hash(
+    async fn debug_trace_block_by_hash(
         &self,
         block_hash: B256,
         opts: Option<GethDebugTracingOptions>,
@@ -122,8 +143,7 @@ pub trait EthereumRpc {
 
     /// Returns traces for a block by number.
     #[method(name = "debug_traceBlockByNumber")]
-    #[blocking]
-    fn debug_trace_block_by_number(
+    async fn debug_trace_block_by_number(
         &self,
         block_number: BlockNumberOrTag,
         opts: Option<GethDebugTracingOptions>,
@@ -136,8 +156,7 @@ pub trait EthereumRpc {
 
     /// Returns trace for a transaction.
     #[method(name = "debug_traceTransaction")]
-    #[blocking]
-    fn debug_trace_transaction(
+    async fn debug_trace_transaction(
         &self,
         tx_hash: B256,
         opts: Option<GethDebugTracingOptions>,
@@ -145,8 +164,7 @@ pub trait EthereumRpc {
 
     /// Handler for `debug_traceCall`
     #[method(name = "debug_traceCall")]
-    #[blocking]
-    fn debug_trace_call(
+    async fn debug_trace_call(
         &self,
         request: TransactionRequest,
         block_id: Option<BlockId>,
@@ -226,12 +244,30 @@ pub trait EthereumRpc {
     /// Install a new block filter
     #[method(name = "eth_newBlockFilter")]
     async fn new_block_filter(&self) -> RpcResult<FilterId>;
+
+    /// Get raw transaction by hash
+    #[method(name = "eth_getRawTransactionByHash")]
+    async fn eth_get_raw_transaction_by_hash(
+        &self,
+        hash: B256,
+        mempool_only: Option<bool>,
+    ) -> RpcResult<Option<Bytes>>;
 }
 
 const ETH_RPC_ERROR: &str = "ETH_RPC_ERROR";
 
 fn to_eth_rpc_error(err: impl ToString) -> ErrorObjectOwned {
     to_jsonrpsee_error_object(ETH_RPC_ERROR, err)
+}
+
+/// How long a `debug_trace*` request waits for a tracing permit before giving up.
+///
+/// Half the RPC timeout, so a request that is admitted still keeps a comparable share of the
+/// window to actually run. Waiting nearly the whole timeout (e.g. 29s of 30s) admitted requests
+/// with no time left to be served, spending a permit and CPU on a trace whose response the RPC
+/// layer had already timed out and dropped. Floored at 1s so a tiny configured timeout still waits.
+fn tracing_queue_timeout(rpc_timeout_secs: u64) -> Duration {
+    Duration::from_secs((rpc_timeout_secs / 2).max(1))
 }
 
 pub struct EthereumRpcServerImpl<C, Da>
@@ -243,8 +279,16 @@ where
     starting_l2_height: U64,
     trace_chain_block_limit: Option<u64>,
     enable_js_tracer: bool,
+    trace_memory_limit_mb: u64,
+    /// Caps how many debug_trace* requests run at once. With `trace_memory_limit_mb` this is what
+    /// bounds the memory tracing can hold: a request that cannot get a permit waits for one.
+    tracing_permits: Arc<Semaphore>,
+    /// How long a request waits for a permit before giving up. Kept below the RPC timeout so a
+    /// caller that will not be served gets a clear error rather than a timeout.
+    tracing_queue_timeout: Duration,
     l2_block_rx: Option<broadcast::Receiver<u64>>,
     max_sync_send_timeout_ms: u64,
+    gas_cap: RpcGasCap,
 }
 
 impl<C, Da> EthereumRpcServerImpl<C, Da>
@@ -252,22 +296,69 @@ where
     C: sov_modules_api::Context,
     Da: DaService,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ethereum: Arc<Ethereum<C, Da>>,
         starting_l2_height: U64,
         trace_chain_block_limit: Option<u64>,
         enable_js_tracer: bool,
+        trace_memory_limit_mb: u64,
+        max_tracing_requests: usize,
+        timeout: u64,
         l2_block_rx: Option<broadcast::Receiver<u64>>,
         max_sync_send_timeout_ms: u64,
+        gas_cap: RpcGasCap,
     ) -> Self {
         Self {
             ethereum,
             starting_l2_height,
             trace_chain_block_limit,
             enable_js_tracer,
+            trace_memory_limit_mb,
+            // Clamp into the range `Semaphore::new` accepts: 0 would deadlock every trace, and a
+            // value above `MAX_PERMITS` panics at startup. A misconfiguration should not take the
+            // node down, so round up to 1 and cap at the maximum.
+            tracing_permits: Arc::new(Semaphore::new(
+                max_tracing_requests.clamp(1, Semaphore::MAX_PERMITS),
+            )),
+            tracing_queue_timeout: tracing_queue_timeout(timeout),
             l2_block_rx,
             max_sync_send_timeout_ms,
+            gas_cap,
         }
+    }
+
+    /// Runs a tracing request on the blocking pool while holding one of the tracing permits.
+    ///
+    /// Waiting for a permit is asynchronous on purpose: a queued request costs a suspended future
+    /// rather than one of the runtime's blocking threads, and if the caller goes away while it is
+    /// queued the future is dropped and the slot is never spent on work nobody will read.
+    async fn with_tracing_permit<T, F>(&self, trace: F) -> RpcResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> RpcResult<T> + Send + 'static,
+    {
+        let permit = tokio::time::timeout(
+            self.tracing_queue_timeout,
+            self.tracing_permits.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            to_eth_rpc_error(
+                "timed out waiting for a tracing slot, too many concurrent debug_trace requests",
+            )
+        })?
+        .expect("tracing semaphore is never closed");
+
+        tokio::task::spawn_blocking(move || {
+            // The permit is tied to the work, not to this future. Blocking tasks cannot be
+            // cancelled, so a request that has already timed out keeps running; releasing its slot
+            // early would let another trace start while its memory is still held.
+            let _permit = permit;
+            trace()
+        })
+        .await
+        .map_err(to_eth_rpc_error)?
     }
 }
 
@@ -278,6 +369,25 @@ where
     C::Storage: NativeStorage,
     Da: DaService,
 {
+    fn eth_call(
+        &self,
+        request: TransactionRequest,
+        block_id: Option<BlockId>,
+        state_overrides: Option<StateOverride>,
+        block_overrides: Option<BlockOverrides>,
+    ) -> RpcResult<Bytes> {
+        let mut working_set = WorkingSet::new(self.ethereum.storage.clone());
+        Evm::<C>::default().get_call_with_gas_cap(
+            request,
+            block_id,
+            state_overrides,
+            block_overrides,
+            &mut working_set,
+            &self.ethereum.ledger_db,
+            self.gas_cap,
+        )
+    }
+
     fn web3_client_version(&self) -> RpcResult<String> {
         Ok(self.ethereum.web3_client_version.clone())
     }
@@ -336,6 +446,16 @@ where
         keys: Vec<JsonStorageKey>,
         block_id: Option<BlockId>,
     ) -> RpcResult<EIP1186AccountProofResponse> {
+        if keys.len() > MAX_GET_PROOF_KEYS {
+            // Match Geth's storage-key cap check before state access:
+            // https://github.com/ethereum/go-ethereum/blob/bd14ba80c6a7ab5a7c37aa21cd0a3d784a2b1c69/internal/ethapi/api.go#L388-L391
+            return Err(EthApiError::InvalidParams(format!(
+                "too many storage keys requested (max {MAX_GET_PROOF_KEYS}, got {})",
+                keys.len()
+            ))
+            .into());
+        }
+
         let mut working_set = WorkingSet::new(self.ethereum.storage.clone());
 
         let evm = Evm::<C>::default();
@@ -362,60 +482,75 @@ where
         Ok(proof)
     }
 
-    fn debug_trace_block_by_hash(
+    async fn debug_trace_block_by_hash(
         &self,
         block_hash: B256,
         opts: Option<GethDebugTracingOptions>,
     ) -> RpcResult<Vec<TraceResult>> {
-        let evm = Evm::<C>::default();
-        let mut working_set = WorkingSet::new(self.ethereum.storage.clone());
+        let ethereum = self.ethereum.clone();
+        let enable_js_tracer = self.enable_js_tracer;
+        let trace_memory_limit_mb = self.trace_memory_limit_mb;
+        self.with_tracing_permit(move || {
+            let evm = Evm::<C>::default();
+            let mut working_set = WorkingSet::new(ethereum.storage.clone());
 
-        let block_number = match evm.get_block_number_by_block_hash(block_hash, &mut working_set) {
-            Some(block_number) => block_number,
-            None => {
-                return Err(EthApiError::HeaderNotFound(block_hash.into()).into());
-            }
-        };
+            let block_number =
+                match evm.get_block_number_by_block_hash(block_hash, &mut working_set) {
+                    Some(block_number) => block_number,
+                    None => {
+                        return Err(EthApiError::HeaderNotFound(block_hash.into()).into());
+                    }
+                };
 
-        debug_trace_by_block_number(
-            block_number,
-            None,
-            &self.ethereum,
-            &evm,
-            &mut working_set,
-            opts,
-            self.enable_js_tracer,
-        )
-        .map_err(to_eth_rpc_error)
+            debug_trace_by_block_number(
+                block_number,
+                None,
+                &ethereum,
+                &evm,
+                &mut working_set,
+                opts,
+                enable_js_tracer,
+                trace_memory_limit_mb,
+            )
+            .map_err(to_eth_rpc_error)
+        })
+        .await
     }
 
-    fn debug_trace_block_by_number(
+    async fn debug_trace_block_by_number(
         &self,
         block_number: BlockNumberOrTag,
         opts: Option<GethDebugTracingOptions>,
     ) -> RpcResult<Vec<TraceResult>> {
-        let mut working_set = WorkingSet::new(self.ethereum.storage.clone());
-        let evm = Evm::<C>::default();
-        let latest_block_number: u64 = evm.block_number(&mut working_set)?.saturating_to();
+        let ethereum = self.ethereum.clone();
+        let enable_js_tracer = self.enable_js_tracer;
+        let trace_memory_limit_mb = self.trace_memory_limit_mb;
+        self.with_tracing_permit(move || {
+            let mut working_set = WorkingSet::new(ethereum.storage.clone());
+            let evm = Evm::<C>::default();
+            let latest_block_number: u64 = evm.block_number(&mut working_set)?.saturating_to();
 
-        let block_number = match block_number {
-            BlockNumberOrTag::Number(block_number) => block_number,
-            BlockNumberOrTag::Latest => latest_block_number,
-            _ => return Err(EthApiError::Unsupported(
-                "Earliest, pending, safe and finalized are not supported for debug_traceBlockByNumber",
-            ).into()),
-        };
+            let block_number = match block_number {
+                BlockNumberOrTag::Number(block_number) => block_number,
+                BlockNumberOrTag::Latest => latest_block_number,
+                _ => return Err(EthApiError::Unsupported(
+                    "Earliest, pending, safe and finalized are not supported for debug_traceBlockByNumber",
+                ).into()),
+            };
 
-        debug_trace_by_block_number(
-            block_number,
-            None,
-            &self.ethereum,
-            &evm,
-            &mut working_set,
-            opts,
-            self.enable_js_tracer,
-        )
-        .map_err(to_eth_rpc_error)
+            debug_trace_by_block_number(
+                block_number,
+                None,
+                &ethereum,
+                &evm,
+                &mut working_set,
+                opts,
+                enable_js_tracer,
+                trace_memory_limit_mb,
+            )
+            .map_err(to_eth_rpc_error)
+        })
+        .await
     }
 
     fn trace_debank_block(&self, block_id: BlockId) -> RpcResult<DebankOutPut> {
@@ -446,56 +581,60 @@ where
     // else; calls the debug_trace_transaction_block function in evm
     // that function traces the entire block, returns all the traces to here
     // then we put them into cache and return the trace of the requested transaction
-    fn debug_trace_transaction(
+    async fn debug_trace_transaction(
         &self,
         tx_hash: B256,
         opts: Option<GethDebugTracingOptions>,
     ) -> RpcResult<GethTrace> {
-        let evm = Evm::<C>::default();
-        let mut working_set = WorkingSet::new(self.ethereum.storage.clone());
+        let ethereum = self.ethereum.clone();
+        let enable_js_tracer = self.enable_js_tracer;
+        let trace_memory_limit_mb = self.trace_memory_limit_mb;
+        self.with_tracing_permit(move || {
+            let evm = Evm::<C>::default();
+            let mut working_set = WorkingSet::new(ethereum.storage.clone());
 
-        let tx = evm
-            .get_transaction_by_hash(tx_hash, &mut working_set)
-            .unwrap()
-            .ok_or_else(|| EthApiError::UnknownBlockOrTxIndex)?;
+            let tx = evm
+                .get_transaction_by_hash(tx_hash, &mut working_set)
+                .unwrap()
+                .ok_or_else(|| EthApiError::UnknownBlockOrTxIndex)?;
 
-        let trace_idx: u64 = tx
-            .transaction_index
-            .expect("Tx index must be set for tx inside block");
+            let trace_idx: u64 = tx
+                .transaction_index
+                .expect("Tx index must be set for tx inside block");
 
-        let block_number: u64 = tx
-            .block_number
-            .expect("Block number must be set for tx inside block");
+            let block_number: u64 = tx
+                .block_number
+                .expect("Block number must be set for tx inside block");
 
-        let traces = debug_trace_by_block_number(
-            block_number,
-            Some(trace_idx as usize),
-            &self.ethereum,
-            &evm,
-            &mut working_set,
-            opts,
-            self.enable_js_tracer,
-        )
-        .map_err(to_eth_rpc_error)?;
+            let traces = debug_trace_by_block_number(
+                block_number,
+                Some(trace_idx as usize),
+                &ethereum,
+                &evm,
+                &mut working_set,
+                opts,
+                enable_js_tracer,
+                trace_memory_limit_mb,
+            )
+            .map_err(to_eth_rpc_error)?;
 
-        match &traces[0] {
-            TraceResult::Success { result, .. } => Ok(result.clone()),
-            // this should never happen since we propagate any tracing error
-            TraceResult::Error { error, tx_hash: _ } => {
-                Err(EthApiError::EvmCustom(error.clone()).into())
+            match &traces[0] {
+                TraceResult::Success { result, .. } => Ok(result.clone()),
+                // this should never happen since we propagate any tracing error
+                TraceResult::Error { error, tx_hash: _ } => {
+                    Err(EthApiError::EvmCustom(error.clone()).into())
+                }
             }
-        }
+        })
+        .await
     }
 
-    fn debug_trace_call(
+    async fn debug_trace_call(
         &self,
         request: TransactionRequest,
         block_id: Option<BlockId>,
         opts: Option<GethDebugTracingCallOptions>,
     ) -> RpcResult<GethTrace> {
-        let mut working_set = WorkingSet::new(self.ethereum.storage.clone());
-        let evm = Evm::<C>::default();
-
         let is_js_tracer = matches!(
             opts.as_ref()
                 .and_then(|o| o.tracing_options.tracer.as_ref()),
@@ -504,13 +643,24 @@ where
         if is_js_tracer && !self.enable_js_tracer {
             return Err(EthApiError::Unsupported("JsTracer is disabled.").into());
         }
-        evm.debug_trace_call(
-            request,
-            block_id,
-            opts,
-            &mut working_set,
-            &self.ethereum.ledger_db,
-        )
+
+        let ethereum = self.ethereum.clone();
+        let trace_memory_limit_mb = self.trace_memory_limit_mb;
+        let gas_cap = self.gas_cap;
+        self.with_tracing_permit(move || {
+            let mut working_set = WorkingSet::new(ethereum.storage.clone());
+            let evm = Evm::<C>::default();
+            evm.debug_trace_call_with_gas_cap(
+                request,
+                block_id,
+                opts,
+                &mut working_set,
+                &ethereum.ledger_db,
+                trace_memory_limit_mb,
+                gas_cap,
+            )
+        })
+        .await
     }
 
     // This method is implemented only for full nodes.
@@ -802,6 +952,8 @@ where
                 self.ethereum.clone(),
                 self.trace_chain_block_limit,
                 self.enable_js_tracer,
+                self.trace_memory_limit_mb,
+                self.tracing_permits.clone(),
             )
             .await;
         } else {
@@ -888,6 +1040,55 @@ where
             .filter_logs(&mut working_set, &evm, id)
             .await?)
     }
+
+    async fn eth_get_raw_transaction_by_hash(
+        &self,
+        hash: B256,
+        mempool_only: Option<bool>,
+    ) -> RpcResult<Option<Bytes>> {
+        match mempool_only {
+            Some(true) => {
+                match self
+                    .ethereum
+                    .sequencer_client
+                    .as_ref()
+                    .unwrap()
+                    .eth_get_raw_transaction_by_hash(hash, Some(true))
+                    .await
+                {
+                    Ok(raw) => Ok(raw),
+                    Err(e) => match e {
+                        jsonrpsee::core::client::Error::Call(e_owned) => Err(e_owned),
+                        _ => Err(to_jsonrpsee_error_object("SEQUENCER_CLIENT_ERROR", e)),
+                    },
+                }
+            }
+            _ => {
+                let evm = Evm::<C>::default();
+                let mut working_set = WorkingSet::new(self.ethereum.storage.clone());
+                match evm.get_transaction_by_hash(hash, &mut working_set) {
+                    Ok(Some(tx)) => Ok(Some(tx.as_recovered().encoded_2718().into())),
+                    Ok(None) => {
+                        match self
+                            .ethereum
+                            .sequencer_client
+                            .as_ref()
+                            .unwrap()
+                            .eth_get_raw_transaction_by_hash(hash, Some(true))
+                            .await
+                        {
+                            Ok(raw) => Ok(raw),
+                            Err(e) => match e {
+                                jsonrpsee::core::client::Error::Call(e_owned) => Err(e_owned),
+                                _ => Err(to_jsonrpsee_error_object("SEQUENCER_CLIENT_ERROR", e)),
+                            },
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -926,13 +1127,29 @@ where
         &l2_block_rx,
         task_executor,
     ));
+    // Both call RPCs receive this server's immutable cap, passed explicitly to the EVM helpers.
+    // Another server or in-process test cannot change the cap used by these requests.
+    // RpcGasCap construction preserves zero and clamps to the maximum.
+    if rpc_config.gas_cap > citrea_evm::RPC_DEFAULT_GAS_CAP {
+        tracing::warn!(
+            configured = rpc_config.gas_cap,
+            max = citrea_evm::RPC_DEFAULT_GAS_CAP,
+            "configured RPC gas_cap exceeds the maximum; clamping to the maximum"
+        );
+    }
+    let gas_cap = RpcGasCap::new(rpc_config.gas_cap);
+
     let server = EthereumRpcServerImpl::new(
         ethereum,
         U64::from(head_l2_block),
         rpc_config.trace_chain_block_limit,
         rpc_config.enable_js_tracer,
+        rpc_config.trace_memory_limit_mb,
+        rpc_config.max_tracing_requests,
+        rpc_config.timeout,
         l2_block_rx,
         rpc_config.max_sync_send_timeout_ms,
+        gas_cap,
     );
 
     let mut module = EthereumRpcServer::into_rpc(server);
@@ -941,6 +1158,7 @@ where
         module.remove_method("eth_sendRawTransaction");
         module.remove_method("eth_sendRawTransactionSync");
         module.remove_method("eth_getTransactionByHash");
+        module.remove_method("eth_getRawTransactionByHash");
         module.remove_method("eth_syncing");
         module.remove_method("citrea_syncStatus");
         module.remove_method("txpool_content");
@@ -962,4 +1180,20 @@ where
     }
 
     module
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_timeout_leaves_time_to_serve() {
+        // half the window, so an admitted request keeps a comparable share to actually run
+        assert_eq!(tracing_queue_timeout(30), Duration::from_secs(15));
+        // never the near-whole timeout that admitted un-servable requests (29s of 30s)
+        assert!(tracing_queue_timeout(30) < Duration::from_secs(30));
+        // floored so a tiny or zero configured timeout still waits briefly
+        assert_eq!(tracing_queue_timeout(1), Duration::from_secs(1));
+        assert_eq!(tracing_queue_timeout(0), Duration::from_secs(1));
+    }
 }

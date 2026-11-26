@@ -9,7 +9,7 @@ use sov_rollup_interface::fork::{Fork, ForkMigration};
 use sov_rollup_interface::stf::StateDiff;
 use sov_rollup_interface::zk::{Proof, ProvingSessionInfo, StorageRootHash};
 use sov_schema_db::{ScanDirection, Schema, SchemaBatch, SchemaIterator, SeekKeyEncoder, DB};
-use tracing::instrument;
+use tracing::{info, instrument};
 use uuid::Uuid;
 
 use crate::rocks_db_config::RocksdbConfig;
@@ -18,10 +18,9 @@ use crate::schema::tables::TestTableNew;
 use crate::schema::tables::{
     CommitmentIndicesByJobId, CommitmentIndicesByL1, CommitmentMerkleRoots, CommitmentsByNumber,
     ExecutedMigrations, JobIdOfCommitment, L2BlockByHash, L2BlockByNumber, L2GenesisStateRoot,
-    L2RangeByL1Height, L2StatusHeights, LastPrunedBlock, LightClientProofBySlotNumber, MempoolTxs,
-    PendingBonsaiSessionByJobId, PendingBoundlessSessionByJobId, PendingL1SubmissionJobs,
-    PendingProofs, PendingSequencerCommitments, ProofByJobId, ProverLastScannedSlot,
-    ProverPendingCommitments, ProverStateDiffs, ProvingSessionInfoByJobId,
+    L2RangeByL1Height, L2StatusHeights, LastPrunedBlock, LightClientProofBySlotNumber,
+    PendingL1SubmissionJobs, PendingProofs, PendingSequencerCommitments, ProofByJobId,
+    ProverLastScannedSlot, ProverPendingCommitments, ProverStateDiffs, ProvingSessionInfoByJobId,
     ProvingSessionInfoBySlotNumber, SequencerCommitmentByIndex, ShortHeaderProofBySlotHash,
     SlotByHash, StateDiffByBlockNumber, VerifiedBatchProofsBySlotNumber, LEDGER_TABLES,
 };
@@ -34,8 +33,7 @@ use crate::schema::types::light_client_proof::{
     StoredLightClientProof, StoredLightClientProofOutput,
 };
 use crate::schema::types::{
-    BonsaiSession, BoundlessSession, L2BlockNumber, L2HeightAndIndex, L2HeightRange,
-    L2HeightStatus, SlotNumber,
+    L2BlockNumber, L2HeightAndIndex, L2HeightRange, L2HeightStatus, SlotNumber,
 };
 
 /// Implementation of database migrator
@@ -623,11 +621,45 @@ impl BatchProverLedgerOps for LedgerDB {
 
         // delete from pending job tables
         schema_batch.delete::<PendingL1SubmissionJobs>(&id)?;
-        schema_batch.delete::<PendingBonsaiSessionByJobId>(&id)?;
-        schema_batch.delete::<PendingBoundlessSessionByJobId>(&id)?;
 
         self.db.write_schemas(schema_batch)?;
         Ok(())
+    }
+
+    #[instrument(level = "trace", skip(self), err)]
+    fn reschedule_in_flight_proving_jobs(&self) -> anyhow::Result<usize> {
+        let mut iter = self.db.iter::<CommitmentIndicesByJobId>()?;
+        iter.seek_to_first();
+
+        let mut schema_batch = SchemaBatch::new();
+        let mut rescheduled = 0;
+
+        for el in iter {
+            let (job_id, indices) = el?.into_tuple();
+
+            // A job with a stored proof is either waiting for DA submission
+            // (handled by pending L1 submission jobs) or already finalized.
+            // Only jobs with no proof are orphaned in-flight jobs whose
+            // proving task was lost on restart.
+            if self.db.get::<ProofByJobId>(&job_id)?.is_some() {
+                continue;
+            }
+
+            for index in &indices {
+                schema_batch.delete::<JobIdOfCommitment>(index)?;
+                schema_batch.put::<ProverPendingCommitments>(index, &())?;
+                info!("Rescheduling commitment with index {index} from job {job_id} for proving");
+            }
+            schema_batch.delete::<ProofByJobId>(&job_id)?;
+            schema_batch.delete::<ProvingSessionInfoByJobId>(&job_id)?;
+            schema_batch.delete::<CommitmentIndicesByJobId>(&job_id)?;
+            schema_batch.delete::<PendingL1SubmissionJobs>(&job_id)?;
+
+            rescheduled += 1;
+        }
+
+        self.db.write_schemas(schema_batch)?;
+        Ok(rescheduled)
     }
 
     #[instrument(level = "trace", skip(self), err)]
@@ -742,57 +774,6 @@ impl BatchProverLedgerOps for LedgerDB {
     }
 }
 
-impl BonsaiLedgerOps for LedgerDB {
-    /// Gets all pending sessions and step numbers
-    #[instrument(level = "trace", skip(self), err)]
-    fn get_pending_bonsai_sessions(&self) -> anyhow::Result<Vec<(Uuid, BonsaiSession)>> {
-        let mut iter = self.db.iter::<PendingBonsaiSessionByJobId>()?;
-        iter.seek_to_first();
-
-        iter.map(|item| item.map(|item| item.into_tuple()))
-            .collect()
-    }
-
-    #[instrument(level = "trace", skip(self), err)]
-    fn upsert_pending_bonsai_session(
-        &self,
-        job_id: Uuid,
-        session: BonsaiSession,
-    ) -> anyhow::Result<()> {
-        self.db
-            .put::<PendingBonsaiSessionByJobId>(&job_id, &session)
-    }
-
-    #[instrument(level = "trace", skip(self), err)]
-    fn remove_pending_bonsai_session(&self, job_id: Uuid) -> anyhow::Result<()> {
-        self.db.delete::<PendingBonsaiSessionByJobId>(&job_id)
-    }
-}
-
-impl BoundlessLedgerOps for LedgerDB {
-    /// Gets all pending sessions and step numbers
-    fn get_pending_boundless_sessions(&self) -> anyhow::Result<Vec<(Uuid, BoundlessSession)>> {
-        let mut iter = self.db.iter::<PendingBoundlessSessionByJobId>()?;
-        iter.seek_to_first();
-
-        iter.map(|item| item.map(|item| item.into_tuple()))
-            .collect()
-    }
-
-    fn upsert_pending_boundless_session(
-        &self,
-        job_id: Uuid,
-        session: BoundlessSession,
-    ) -> anyhow::Result<()> {
-        self.db
-            .put::<PendingBoundlessSessionByJobId>(&job_id, &session)
-    }
-
-    fn remove_pending_boundless_session(&self, job_id: Uuid) -> anyhow::Result<()> {
-        self.db.delete::<PendingBoundlessSessionByJobId>(&job_id)
-    }
-}
-
 impl SequencerLedgerOps for LedgerDB {
     /// Sets the state diff by block number
     #[instrument(level = "trace", skip(self), err, ret)]
@@ -829,35 +810,6 @@ impl SequencerLedgerOps for LedgerDB {
         self.db
             .get::<StateDiffByBlockNumber>(&l2_height)
             .map(|diff| diff.unwrap_or_default())
-    }
-
-    fn insert_mempool_tx(&self, tx_hash: Vec<u8>, tx: Vec<u8>) -> anyhow::Result<()> {
-        let mut schema_batch = SchemaBatch::new();
-        schema_batch.put::<MempoolTxs>(&tx_hash, &tx)?;
-
-        self.db.write_schemas(schema_batch)?;
-
-        Ok(())
-    }
-
-    fn get_mempool_txs(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let mut iter = self.db.iter::<MempoolTxs>()?;
-        iter.seek_to_first();
-
-        let txs = iter
-            .map(|item| item.map(|item| (item.key, item.value)))
-            .collect::<Result<Vec<(Vec<u8>, Vec<u8>)>, _>>()?;
-
-        Ok(txs)
-    }
-
-    fn remove_mempool_txs(&self, tx_hashes: Vec<Vec<u8>>) -> anyhow::Result<()> {
-        let mut schema_batch = SchemaBatch::new();
-        for tx_hash in tx_hashes {
-            schema_batch.delete::<MempoolTxs>(&tx_hash)?;
-        }
-        self.db.write_schemas(schema_batch)?;
-        Ok(())
     }
 }
 
@@ -931,6 +883,17 @@ impl NodeLedgerOps for LedgerDB {
         l1_height: u64,
         val: L2HeightAndIndex,
     ) -> anyhow::Result<()> {
+        // The status is read from the row with the highest L1 height. A rescan of L1 blocks
+        // processed before would write under a later row, which hides it, so it writes there.
+        let mut iter = self
+            .db
+            .iter_with_direction::<L2StatusHeights>(Default::default(), ScanDirection::Backward)?;
+        iter.seek_for_prev(&(status, u64::MAX))?;
+        let l1_height = match iter.next().transpose()? {
+            Some(item) if item.key.0 == status => l1_height.max(item.key.1),
+            _ => l1_height,
+        };
+
         let mut schema_batch = SchemaBatch::new();
         schema_batch.put::<L2StatusHeights>(&(status, l1_height), &val)?;
         self.db.write_schemas(schema_batch)?;

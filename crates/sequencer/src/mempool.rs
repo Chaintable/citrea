@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use alloy_eips::Typed2718;
@@ -10,16 +11,20 @@ use reth_transaction_pool::blobstore::NoopBlobStore;
 use reth_transaction_pool::error::{PoolError, PoolErrorKind};
 use reth_transaction_pool::{
     AllPoolTransactions, BestTransactions, BestTransactionsAttributes, CoinbaseTipOrdering,
-    EthPooledTransaction, EthTransactionValidator, Pool, PoolConfig, PoolResult, PoolTransaction,
-    SubPoolLimit, TransactionPool, TransactionValidationTaskExecutor, ValidPoolTransaction,
+    EthPooledTransaction, Pool, PoolConfig, PoolResult, PoolTransaction, SubPoolLimit,
+    TransactionPool, TransactionValidationTaskExecutor, ValidPoolTransaction,
 };
 use sov_modules_api::SpecId;
 
 use crate::db_provider::DbProvider;
+use crate::tx_validator::CitreaTransactionValidator;
+
+/// Saving the pool on shutdown and restoring it on startup.
+mod persistence;
 
 /// The concrete implementation type for the Citrea mempool, using Reth's Pool with custom configuration
 type CitreaMempoolImpl = Pool<
-    TransactionValidationTaskExecutor<EthTransactionValidator<DbProvider, EthPooledTransaction>>,
+    TransactionValidationTaskExecutor<CitreaTransactionValidator>,
     CoinbaseTipOrdering<EthPooledTransaction>,
     NoopBlobStore,
 >;
@@ -28,7 +33,12 @@ type CitreaMempoolImpl = Pool<
 type Transaction = <CitreaMempoolImpl as TransactionPool>::Transaction;
 
 /// An abstraction on top of Reth's mempool with custom Citrea functionality.
-pub struct CitreaMempool(CitreaMempoolImpl);
+pub struct CitreaMempool {
+    /// Reth pool.
+    pool: CitreaMempoolImpl,
+    /// File the pool is saved to on graceful shutdown and restored from on startup.
+    snapshot_path: PathBuf,
+}
 
 impl CitreaMempool {
     /// Creates a new instance of the Citrea mempool.
@@ -36,6 +46,7 @@ impl CitreaMempool {
         client: DbProvider,
         mempool_conf: SequencerMempoolConfig,
         task_executor: TaskExecutor,
+        snapshot_path: PathBuf,
     ) -> anyhow::Result<Self> {
         let blob_store = NoopBlobStore::default();
 
@@ -64,6 +75,9 @@ impl CitreaMempool {
             ..Default::default()
         };
 
+        // Keep a provider handle for the custom validator before `client` is moved into the builder.
+        let provider = client.clone();
+
         let validator = TransactionValidationTaskExecutor::eth_builder(client)
             .no_eip4844()
             .set_shanghai(true)
@@ -72,9 +86,25 @@ impl CitreaMempool {
             // TODO: if we ever increase block gas limits, we need to pull this from
             // somewhere else
             .set_block_gas_limit(evm_config.block_gas_limit)
-            .build_with_tasks::<EthPooledTransaction, _, _>(task_executor, blob_store);
+            // Admission runs a per-tx EVM simulation to reserve the L1 fee, so run validation
+            // across several tasks in parallel instead of the single default task.
+            .with_additional_tasks(mempool_conf.additional_validation_tasks as usize)
+            .build_with_tasks::<EthPooledTransaction, _, _>(task_executor, blob_store)
+            // Wrap the stock validator so it also reserves the Citrea L1 fee. `.map` preserves
+            // the already-spawned validation-task channel.
+            .map(move |inner| CitreaTransactionValidator::new(inner, provider.clone()));
 
-        Ok(Self(Pool::eth_pool(validator, blob_store, pool_config)))
+        // `Pool::eth_pool` is hardcoded to `EthTransactionValidator`, so build the pool directly
+        // with the same ordering it would have used.
+        Ok(Self {
+            pool: Pool::new(
+                validator,
+                CoinbaseTipOrdering::default(),
+                blob_store,
+                pool_config,
+            ),
+            snapshot_path,
+        })
     }
 
     /// Add a transaction to the mempool
@@ -100,17 +130,17 @@ impl CitreaMempool {
             ));
         }
 
-        self.0.add_external_transaction(transaction).await
+        self.pool.add_external_transaction(transaction).await
     }
 
     /// Find and return a transaction by hash
     pub(crate) fn get(&self, hash: &TxHash) -> Option<Arc<ValidPoolTransaction<Transaction>>> {
-        self.0.get(hash)
+        self.pool.get(hash)
     }
 
     /// Returns all transactions in the pool
     pub(crate) fn all_transactions(&self) -> AllPoolTransactions<Transaction> {
-        self.0.all_transactions()
+        self.pool.all_transactions()
     }
 
     /// Remove all transactions corresponding to the given hashes.
@@ -118,7 +148,7 @@ impl CitreaMempool {
         &self,
         tx_hashes: Vec<TxHash>,
     ) -> Vec<Arc<ValidPoolTransaction<Transaction>>> {
-        self.0.remove_transactions(tx_hashes)
+        self.pool.remove_transactions(tx_hashes)
     }
 
     /// Removes all transactions corresponding to the given hashes
@@ -127,7 +157,7 @@ impl CitreaMempool {
         &self,
         tx_hashes: Vec<TxHash>,
     ) -> Vec<Arc<ValidPoolTransaction<Transaction>>> {
-        self.0.remove_transactions_and_descendants(tx_hashes)
+        self.pool.remove_transactions_and_descendants(tx_hashes)
     }
 
     /// Removes all transactions from the given sender
@@ -135,7 +165,7 @@ impl CitreaMempool {
         &self,
         sender: Address,
     ) -> Vec<Arc<ValidPoolTransaction<Transaction>>> {
-        self.0.remove_transactions_by_sender(sender)
+        self.pool.remove_transactions_by_sender(sender)
     }
 
     /// Gets the best transactions from the mempool with specific attributes
@@ -149,7 +179,7 @@ impl CitreaMempool {
         &self,
         best_transactions_attributes: BestTransactionsAttributes,
     ) -> Box<dyn BestTransactions<Item = Arc<ValidPoolTransaction<Transaction>>>> {
-        self.0
+        self.pool
             .best_transactions_with_attributes(best_transactions_attributes)
     }
 
@@ -157,6 +187,6 @@ impl CitreaMempool {
     ///
     /// This is needed for the maintenance task to access the pool directly
     pub(crate) fn inner_pool(&self) -> &CitreaMempoolImpl {
-        &self.0
+        &self.pool
     }
 }

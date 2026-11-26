@@ -160,13 +160,11 @@ impl BackupManager {
         let l2_lock = self.l2_processing_lock.lock().await;
 
         let (l1_block_height, l2_block_height) = match self.node_type {
-            // Sequencer does not have L1 blocks, so we use L2 height
-            NodeType::Sequencer => (None, ledger_db.get_head_l2_block_height()?),
             NodeType::LightClientProver => {
                 // Light client prover does not have L2 blocks, so we use L1 height
                 (ledger_db.get_last_scanned_l1_height()?.map(|h| h.0), None)
             }
-            NodeType::FullNode | NodeType::BatchProver => (
+            NodeType::Sequencer | NodeType::FullNode | NodeType::BatchProver => (
                 ledger_db.get_last_scanned_l1_height()?.map(|h| h.0),
                 ledger_db.get_head_l2_block_height()?,
             ),
@@ -330,18 +328,18 @@ impl BackupManager {
         let backup_path = backup_path.as_ref();
 
         if !backup_path.exists() {
-            bail!("Backup directory does not exist: {:?}", backup_path);
+            bail!("Backup directory does not exist: {backup_path:?}");
         }
 
         let mut sizes = HashSet::new();
         for dir in &self.config.backup_dirs {
             let path = backup_path.join(dir);
             if !path.exists() {
-                bail!("Missing required directory '{}' in backup", dir);
+                bail!("Missing required directory '{dir}' in backup");
             }
 
             if path.read_dir()?.next().is_none() {
-                bail!("Directory '{}' is empty ", dir);
+                bail!("Directory '{dir}' is empty ");
             }
 
             let backup_size = validate_backup(&path)?;
@@ -361,7 +359,7 @@ impl BackupManager {
     ) -> anyhow::Result<HashMap<String, Vec<BackupEngineInfo>>> {
         let backup_path = backup_path.as_ref();
         if !backup_path.exists() {
-            bail!("Backup directory does not exist: {:?}", backup_path);
+            bail!("Backup directory does not exist: {backup_path:?}");
         }
 
         let mut map = HashMap::new();
@@ -393,7 +391,7 @@ impl BackupManager {
         let _permit = self.create_backup_semaphore.acquire().await?;
 
         if !backup_path.exists() {
-            bail!("Backup directory does not exist: {:?}", backup_path);
+            bail!("Backup directory does not exist: {backup_path:?}");
         }
 
         let start_time = Instant::now();

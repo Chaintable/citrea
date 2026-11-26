@@ -79,9 +79,10 @@ pub async fn start_rollup(
         panic!("Both batch prover and light client prover config cannot be set at the same time");
     }
 
-    if rollup_config.telemetry.bind_host.is_some() && rollup_config.telemetry.bind_port.is_some() {
-        let bind_host = rollup_config.telemetry.bind_host.as_ref().unwrap();
-        let bind_port = rollup_config.telemetry.bind_port.unwrap();
+    if let (Some(bind_host), Some(bind_port)) = (
+        rollup_config.telemetry.bind_host.as_ref(),
+        rollup_config.telemetry.bind_port,
+    ) {
         PROMETHEUS_INITIALIZED.get_or_init(|| {
             let telemetry_addr: std::net::SocketAddr = format!("{bind_host}:{bind_port}")
                 .parse()
@@ -135,7 +136,7 @@ pub async fn start_rollup(
                 .iter()
                 .map(|table| table.to_string())
                 .collect::<Vec<_>>(),
-            citrea_fullnode::db_migrations::migrations(),
+            citrea_fullnode::db_migrations::migrations(network),
             Arc::new(BackupManager::new(NodeType::FullNode, None, None)),
         )
     };
@@ -504,6 +505,10 @@ pub fn create_default_rollup_config(
             enable_subscriptions: true,
             max_subscriptions_per_connection: 100,
             trace_chain_block_limit: None,
+            trace_memory_limit_mb: 512,
+            trace_cache_limit_mb: 512,
+            max_tracing_requests: 4,
+            gas_cap: 100_000_000,
             proving_jobs_limit: 100,
             timeout: 30,
             stale_filter_ttl: Some(10),
@@ -593,7 +598,7 @@ pub async fn wait_for_prover_job(
 
         let now = SystemTime::now();
         if start + timeout <= now {
-            bail!("Timeout. Failed to get prover job {}", job_id);
+            bail!("Timeout. Failed to get prover job {job_id}");
         }
 
         sleep(Duration::from_secs(1)).await;
@@ -619,7 +624,7 @@ pub async fn wait_for_prover_l1_height_proofs(
 
         let now = SystemTime::now();
         if start + timeout <= now {
-            bail!("Timeout. Failed to get batch proofs on L1 height {}", num);
+            bail!("Timeout. Failed to get batch proofs on L1 height {num}");
         }
 
         sleep(Duration::from_secs(1)).await;
@@ -645,10 +650,7 @@ pub async fn wait_for_prover_l1_height(
 
         let now = SystemTime::now();
         if start + timeout <= now {
-            bail!(
-                "Timeout. Failed to wait for batch prover to scan L1 height {}",
-                num
-            );
+            bail!("Timeout. Failed to wait for batch prover to scan L1 height {num}");
         }
 
         sleep(Duration::from_secs(1)).await;
@@ -666,10 +668,7 @@ pub async fn wait_for_prover_job_count(
 
     loop {
         if start.elapsed() >= timeout {
-            bail!(
-                "BatchProver failed to reach proving job count {} on time",
-                count
-            );
+            bail!("BatchProver failed to reach proving job count {count} on time");
         }
 
         let jobs = prover_client.get_proving_jobs(count, None).await;

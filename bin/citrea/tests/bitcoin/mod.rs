@@ -16,12 +16,14 @@ pub mod bitcoin_test;
 pub mod bitcoin_verifier;
 #[cfg(feature = "testing")]
 pub mod da_queue;
-pub mod fork;
+#[cfg(feature = "testing")]
+pub mod da_restore;
 #[cfg(feature = "testing")]
 pub mod full_node;
 pub mod guest_cycles;
 pub mod sequencer_commitments;
 pub mod sequencer_test;
+pub mod succinct_network_test;
 pub mod syncing;
 pub mod tangerine_related;
 pub mod taproot_key_spend;

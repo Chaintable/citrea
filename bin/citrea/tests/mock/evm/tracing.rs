@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Instant;
 
 use alloy_primitives::ruint::aliases::U256;
-use alloy_primitives::{Address, Bytes};
+use alloy_primitives::{keccak256, Address, Bytes};
+use alloy_rpc_types::state::{AccountOverride, StateOverride};
 use alloy_rpc_types::{BlockId, BlockNumberOrTag, TransactionInput, TransactionRequest};
 use alloy_rpc_types_trace::geth::call::FlatCallFrame;
 use alloy_rpc_types_trace::geth::mux::{MuxConfig, MuxFrame};
@@ -10,20 +13,26 @@ use alloy_rpc_types_trace::geth::GethTrace::{
     self, CallTracer, FlatCallTracer, FourByteTracer, MuxTracer, PreStateTracer,
 };
 use alloy_rpc_types_trace::geth::{
-    CallConfig, CallFrame, FourByteFrame, GethDebugBuiltInTracerType, GethDebugTracerType,
-    GethDebugTracingCallOptions, GethDebugTracingOptions, PreStateConfig, PreStateFrame,
-    TraceResult,
+    CallConfig, CallFrame, CallLogFrame, FourByteFrame, GethDebugBuiltInTracerType,
+    GethDebugTracerType, GethDebugTracingCallOptions, GethDebugTracingOptions, PreStateConfig,
+    PreStateFrame, TraceResult,
 };
 // use citrea::initialize_logging;
 use citrea_common::SequencerConfig;
-use citrea_evm::smart_contracts::{CallerContract, SimpleStorageContract};
+use citrea_evm::smart_contracts::{
+    AnotherLogEvent, BlockHashContract, CallerContract, LogEvent, LogsContract,
+    SimpleStorageContract, TestContract,
+};
 use citrea_stf::genesis_config::GenesisPaths;
+use jsonrpsee::core::client::ClientT;
+use jsonrpsee::http_client::HttpClientBuilder;
+use jsonrpsee::rpc_params;
 use reth_tasks::TaskManager;
 use serde_json::{self, json};
 
 use crate::common::client::{TestClient, MAX_FEE_PER_GAS};
 use crate::common::helpers::{
-    create_default_rollup_config, start_rollup, tempdir_with_children, NodeMode,
+    create_default_rollup_config, start_rollup, tempdir_with_children, wait_for_l2_block, NodeMode,
 };
 use crate::common::{make_test_client, TEST_DATA_GENESIS_PATH};
 
@@ -35,19 +44,29 @@ struct TestContractInfo {
 
 async fn init_sequencer(
 ) -> Result<(TaskManager, Box<TestClient>, TestContractInfo), Box<dyn std::error::Error>> {
+    init_sequencer_with_trace_memory_limit(
+        citrea_common::RpcConfig::default().trace_memory_limit_mb,
+    )
+    .await
+}
+
+async fn init_sequencer_with_trace_memory_limit(
+    trace_memory_limit_mb: u64,
+) -> Result<(TaskManager, Box<TestClient>, TestContractInfo), Box<dyn std::error::Error>> {
     let storage_dir = tempdir_with_children(&["DA", "sequencer"]);
     let da_db_dir = storage_dir.path().join("DA").to_path_buf();
     let sequencer_db_dir = storage_dir.path().join("sequencer").to_path_buf();
 
     let (port_tx, port_rx) = tokio::sync::oneshot::channel();
 
-    let rollup_config = create_default_rollup_config(
+    let mut rollup_config = create_default_rollup_config(
         true,
         &sequencer_db_dir,
         &da_db_dir,
         NodeMode::SequencerNode,
         None,
     );
+    rollup_config.rpc.trace_memory_limit_mb = trace_memory_limit_mb;
     let sequencer_config = SequencerConfig::default();
 
     // Don't provide a prover since the EVM is not currently provable
@@ -115,6 +134,85 @@ async fn init_sequencer(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_call_tracer_cache_miss_only_traces_target() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (task_manager, test_client, _) = init_sequencer_with_trace_memory_limit(1).await?;
+    let recipient = Address::from([0xEE; 20]);
+    let call_with_512kib_input = [
+        0x5f, 0x5f, 0x62, 0x08, 0x00, 0x00, 0x5f, 0x5f, 0x60, 0x01, 0x5f, 0xf1, 0x50,
+    ];
+    let mut heavy_init_code = call_with_512kib_input.repeat(3);
+    heavy_init_code.push(0x00);
+
+    let early = test_client.send_eth(recipient, None, None, None, 1).await?;
+    let prefix = test_client
+        .deploy_contract(heavy_init_code.clone(), None)
+        .await?;
+    let target = test_client.send_eth(recipient, None, None, None, 2).await?;
+    let suffix = test_client.deploy_contract(heavy_init_code, None).await?;
+    test_client.send_publish_batch_request().await;
+
+    let early = early.get_receipt().await?;
+    let prefix = prefix.get_receipt().await?;
+    let target = target.get_receipt().await?;
+    let suffix = suffix.get_receipt().await?;
+    let block_number = target.block_number.unwrap();
+    for receipt in [&early, &prefix, &suffix] {
+        assert_eq!(receipt.block_number, Some(block_number));
+    }
+    assert!(prefix.transaction_index.unwrap() < target.transaction_index.unwrap());
+    assert!(target.transaction_index.unwrap() < suffix.transaction_index.unwrap());
+
+    let opts = GethDebugTracingOptions::call_tracer(CallConfig::default());
+    for (receipt, value) in [(&target, 2u64), (&early, 1), (&target, 2)] {
+        let frame = test_client
+            .debug_trace_transaction(receipt.transaction_hash, Some(opts.clone()))
+            .await
+            .try_into_call_frame()
+            .unwrap();
+        assert_eq!(frame.from, test_client.from_addr);
+        assert_eq!(frame.to, Some(recipient));
+        assert_eq!(frame.value, Some(U256::from(value)));
+        assert_eq!(frame.gas_used, U256::from(21_000));
+        assert!(frame.calls.is_empty());
+    }
+
+    let flat_trace = test_client
+        .debug_trace_transaction(
+            target.transaction_hash,
+            Some(GethDebugTracingOptions::default().with_tracer(
+                GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::FlatCallTracer),
+            )),
+        )
+        .await
+        .try_into_flat_call_frame()
+        .unwrap();
+    assert_eq!(flat_trace.len(), 1);
+    assert_eq!(
+        flat_trace[0].transaction_hash,
+        Some(target.transaction_hash)
+    );
+    assert_eq!(flat_trace[0].transaction_position, target.transaction_index);
+    assert_eq!(flat_trace[0].block_number, Some(block_number));
+
+    let rpc = HttpClientBuilder::default().build(format!("http://{}", test_client.rpc_addr))?;
+    let whole_block: Result<Vec<TraceResult>, _> = rpc
+        .request(
+            "debug_traceBlockByNumber",
+            rpc_params![BlockNumberOrTag::Number(block_number), opts],
+        )
+        .await;
+    let err = whole_block.expect_err("a single-target trace must not populate the block cache");
+    assert!(
+        err.to_string().contains("memory limit"),
+        "expected the full block to exceed the memory budget, got: {err}"
+    );
+
+    task_manager.graceful_shutdown();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_call_tracer() -> Result<(), Box<dyn std::error::Error>> {
     let (task_manager, test_client, contract_info) = init_sequencer().await?;
     let TestContractInfo {
@@ -163,14 +261,14 @@ async fn test_call_tracer() -> Result<(), Box<dyn std::error::Error>> {
 
     let json_value = serde_json::from_value::<CallFrame>(json! [{
       "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
-      "gas": "0x1c96f3c",
+      "gas": "0x5f58cbc",
       "gasUsed": "0xba65",
       "to": "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512",
       "input": "0xb7d5b6580000000000000000000000005fbdb2315678afecb367f032d93f642f64180aa30000000000000000000000000000000000000000000000000000000000000003",
       "calls": [
         {
           "from": "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512",
-          "gas": "0x1c23bb5",
+          "gas": "0x5dda8bf",
           "gasUsed": "0x57f2",
           "to": "0x5fbdb2315678afecb367f032d93f642f64180aa3",
           "input": "0x60fe47b10000000000000000000000000000000000000000000000000000000000000003",
@@ -523,6 +621,162 @@ async fn test_call_tracer() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_call_tracer_with_log() -> Result<(), Box<dyn std::error::Error>> {
+    let (task_manager, test_client, _contract_info) = init_sequencer().await?;
+
+    let logs_contract = LogsContract::default();
+    let deploy_logs_contract_req = test_client
+        .deploy_contract(logs_contract.byte_code(), None)
+        .await?;
+
+    test_client.send_publish_batch_request().await;
+
+    let logs_contract_address = deploy_logs_contract_req
+        .get_receipt()
+        .await?
+        .contract_address
+        .unwrap();
+
+    // publishEvent emits a Log and then an AnotherLog event
+    let test_msg = "5655".to_string();
+    let publish_event_req = test_client
+        .contract_transaction(
+            logs_contract_address,
+            logs_contract.publish_event(test_msg.clone()),
+            None,
+        )
+        .await;
+
+    test_client.send_publish_batch_request().await;
+
+    let receipt = publish_event_req.get_receipt().await?;
+    let tx_hash = receipt.transaction_hash;
+
+    let with_log_trace = test_client
+        .debug_trace_transaction(
+            tx_hash,
+            Some(
+                GethDebugTracingOptions::default()
+                    .with_tracer(GethDebugTracerType::BuiltInTracer(
+                        GethDebugBuiltInTracerType::CallTracer,
+                    ))
+                    .with_call_config(CallConfig {
+                        only_top_call: Some(false),
+                        with_log: Some(true),
+                    }),
+            ),
+        )
+        .await
+        .try_into_call_frame()
+        .unwrap();
+
+    let (log_payload, another_log_payload) = decode_call_frame_logs(&with_log_trace.logs);
+
+    assert_eq!(log_payload.address, logs_contract_address);
+    assert_eq!(log_payload.sender, test_client.from_addr);
+    assert_eq!(log_payload.contractAddress, logs_contract_address);
+    // senderMessage is an indexed string, so the event only carries its hash
+    assert_eq!(log_payload.senderMessage, keccak256(test_msg));
+    assert_eq!(log_payload.message, "Hello World!");
+    assert_eq!(another_log_payload.address, logs_contract_address);
+    assert_eq!(another_log_payload.contractAddress, logs_contract_address);
+
+    test_client
+        .debug_trace_block_by_number(
+            BlockNumberOrTag::Number(receipt.block_number.unwrap()),
+            Some(GethDebugTracingOptions::call_tracer(CallConfig::default())),
+        )
+        .await;
+
+    // The same request is now served from the trace cache
+    let cached_with_log_trace = test_client
+        .debug_trace_transaction(
+            tx_hash,
+            Some(
+                GethDebugTracingOptions::default()
+                    .with_tracer(GethDebugTracerType::BuiltInTracer(
+                        GethDebugBuiltInTracerType::CallTracer,
+                    ))
+                    .with_call_config(CallConfig {
+                        only_top_call: Some(false),
+                        with_log: Some(true),
+                    }),
+            ),
+        )
+        .await
+        .try_into_call_frame()
+        .unwrap();
+
+    assert_eq!(cached_with_log_trace, with_log_trace);
+
+    // withlog false must strip the logs off the cached trace and change nothing else
+    let without_log_trace = test_client
+        .debug_trace_transaction(
+            tx_hash,
+            Some(
+                GethDebugTracingOptions::default()
+                    .with_tracer(GethDebugTracerType::BuiltInTracer(
+                        GethDebugBuiltInTracerType::CallTracer,
+                    ))
+                    .with_call_config(CallConfig {
+                        only_top_call: Some(false),
+                        with_log: Some(false),
+                    }),
+            ),
+        )
+        .await
+        .try_into_call_frame()
+        .unwrap();
+
+    assert_eq!(
+        without_log_trace,
+        CallFrame {
+            logs: vec![],
+            ..with_log_trace.clone()
+        }
+    );
+
+    // no call config at all defaults to withlog false
+    let default_config_trace = test_client
+        .debug_trace_transaction(
+            tx_hash,
+            Some(GethDebugTracingOptions::default().with_tracer(
+                GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::CallTracer),
+            )),
+        )
+        .await
+        .try_into_call_frame()
+        .unwrap();
+
+    assert_eq!(default_config_trace, without_log_trace);
+
+    task_manager.graceful_shutdown();
+    Ok(())
+}
+
+fn decode_call_frame_logs(
+    logs: &[CallLogFrame],
+) -> (
+    alloy_primitives::Log<LogEvent>,
+    alloy_primitives::Log<AnotherLogEvent>,
+) {
+    assert_eq!(logs.len(), 2);
+
+    let into_log = |log: &CallLogFrame| {
+        alloy_primitives::Log::new_unchecked(
+            log.address.unwrap(),
+            log.topics.clone().unwrap(),
+            log.data.clone().unwrap(),
+        )
+    };
+
+    let log_payload = LogsContract::decode_log_event(&into_log(&logs[0])).unwrap();
+    let another_log_payload = LogsContract::decode_another_log_event(&into_log(&logs[1])).unwrap();
+
+    (log_payload, another_log_payload)
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_flat_call_tracer() -> Result<(), Box<dyn std::error::Error>> {
     let (task_manager, test_client, contract_info) = init_sequencer().await?;
     let TestContractInfo {
@@ -568,7 +822,7 @@ async fn test_flat_call_tracer() -> Result<(), Box<dyn std::error::Error>> {
         "action": {
             "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
             "callType": "call",
-            "gas": "0x1c9c380",
+            "gas": "0x5f5e100",
             "input": "0xb7d5b6580000000000000000000000005fbdb2315678afecb367f032d93f642f64180aa30000000000000000000000000000000000000000000000000000000000000003",
             "to": "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512",
             "value": "0x0"
@@ -584,7 +838,7 @@ async fn test_flat_call_tracer() -> Result<(), Box<dyn std::error::Error>> {
         "action": {
             "from": "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512",
             "callType": "call",
-            "gas": "0x1c23bb5",
+            "gas": "0x5dda8bf",
             "input": "0x60fe47b10000000000000000000000000000000000000000000000000000000000000003",
             "to": "0x5fbdb2315678afecb367f032d93f642f64180aa3",
             "value": "0x0"
@@ -642,7 +896,7 @@ async fn test_flat_call_tracer() -> Result<(), Box<dyn std::error::Error>> {
         "action": {
             "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
             "callType": "call",
-            "gas": "0x1c9c380",
+            "gas": "0x5f5e100",
             "input": "0x",
             "to": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92255",
             "value": "0x4563918244f40000"
@@ -664,7 +918,8 @@ async fn test_flat_call_tracer() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .unwrap();
     test_client.send_publish_batch_request().await;
-    let send_eth_tx_hash = send_eth_req.get_receipt().await.unwrap().transaction_hash;
+    let send_eth_receipt = send_eth_req.get_receipt().await.unwrap();
+    let send_eth_tx_hash = send_eth_receipt.transaction_hash;
 
     // get the trace of send_eth_tx_hash and expect call_tx_hash trace to be in the cache
     let send_eth_trace = test_client
@@ -686,6 +941,7 @@ async fn test_flat_call_tracer() -> Result<(), Box<dyn std::error::Error>> {
             "value": "0x4563918244f40000"
         },
         "blockNumber":2,
+        "blockHash": send_eth_receipt.block_hash.unwrap(),
         "result": {
             "gasUsed": "0x5208",
             "output": "0x"
@@ -713,6 +969,7 @@ async fn test_flat_call_tracer() -> Result<(), Box<dyn std::error::Error>> {
             "value": "0x4563918244f40000"
         },
         "blockNumber":2,
+        "blockHash": send_eth_receipt.block_hash.unwrap(),
         "result": {
             "gasUsed": "0x5208",
             "output": "0x"
@@ -792,11 +1049,8 @@ async fn test_flat_call_tracer() -> Result<(), Box<dyn std::error::Error>> {
 
     test_client.send_publish_batch_request().await;
 
-    let ss_contract_tx_hash = deploy_ss_contract_req
-        .get_receipt()
-        .await
-        .unwrap()
-        .transaction_hash;
+    let deploy_ss_contract_receipt = deploy_ss_contract_req.get_receipt().await.unwrap();
+    let ss_contract_tx_hash = deploy_ss_contract_receipt.transaction_hash;
 
     // get the trace of send_eth_tx_hash and expect call_tx_hash trace to be in the cache
     let deploy_contract_trace = test_client
@@ -817,6 +1071,7 @@ async fn test_flat_call_tracer() -> Result<(), Box<dyn std::error::Error>> {
             "creationMethod": "create"
         },
         "blockNumber":3,
+        "blockHash": deploy_ss_contract_receipt.block_hash.unwrap(),
         "result": {
             "address": "0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9",
             "code": "0x608060405234801561000f575f80fd5b506004361061003f575f3560e01c80634e70b1dc1461004357806360fe47b1146100615780636d4ce63c1461007d575b5f80fd5b61004b61009b565b60405161005891906100c9565b60405180910390f35b61007b60048036038101906100769190610110565b6100a0565b005b6100856100a9565b60405161009291906100c9565b60405180910390f35b5f5481565b805f8190555050565b5f8054905090565b5f819050919050565b6100c3816100b1565b82525050565b5f6020820190506100dc5f8301846100ba565b92915050565b5f80fd5b6100ef816100b1565b81146100f9575f80fd5b50565b5f8135905061010a816100e6565b92915050565b5f60208284031215610125576101246100e2565b5b5f610132848285016100fc565b9150509291505056fea264697066735822122011ac1b48890fc5332d67a2b84f4a617f861d0d0d10b928535aa5655c9ab1c66664736f6c63430008180033",
@@ -1111,7 +1366,7 @@ async fn test_pre_state_tracer_disable_code() -> Result<(), Box<dyn std::error::
     // Verify no code is present in either pre or post states
     if let GethTrace::PreStateTracer(PreStateFrame::Diff(diff_mode)) = trace_result {
         // Check that no account in pre state has code
-        for (_, account_state) in diff_mode.pre.iter() {
+        for account_state in diff_mode.pre.values() {
             assert!(
                 account_state.code.is_none(),
                 "Code should be None in pre state when disableCode=true"
@@ -1119,7 +1374,7 @@ async fn test_pre_state_tracer_disable_code() -> Result<(), Box<dyn std::error::
         }
 
         // Check that no account in post state has code
-        for (_, account_state) in diff_mode.post.iter() {
+        for account_state in diff_mode.post.values() {
             assert!(
                 account_state.code.is_none(),
                 "Code should be None in post state when disableCode=true"
@@ -1298,7 +1553,7 @@ async fn test_mux_tracer() -> Result<(), Box<dyn std::error::Error>> {
         },
         "callTracer": {
             "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
-            "gas": "0x1c96f3c",
+            "gas": "0x5f58cbc",
             "gasUsed": "0xba65",
             "to": "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512",
             "input": "0xb7d5b6580000000000000000000000005fbdb2315678afecb367f032d93f642f64180aa30000000000000000000000000000000000000000000000000000000000000003",
@@ -1464,7 +1719,7 @@ async fn test_noop_tracer() -> Result<(), Box<dyn std::error::Error>> {
     } = contract_info;
 
     let addr = Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92255").unwrap();
-    let _ = test_client
+    let send_eth_req = test_client
         .send_eth(addr, None, None, None, 5_000_000_000_000_000_000u128)
         .await
         .unwrap();
@@ -1478,28 +1733,311 @@ async fn test_noop_tracer() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     test_client.send_publish_batch_request().await;
 
-    let call_tx_hash = call_get_value_req
-        .get_receipt()
-        .await
-        .unwrap()
-        .transaction_hash;
+    let send_eth_receipt = send_eth_req.get_receipt().await.unwrap();
+    let call_receipt = call_get_value_req.get_receipt().await.unwrap();
+    let call_tx_hash = call_receipt.transaction_hash;
 
     let noop_opts = Some(GethDebugTracingOptions::default().with_tracer(
         GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::NoopTracer),
     ));
 
     let noop_call_get_trace = test_client
-        .debug_trace_transaction(call_tx_hash, noop_opts)
+        .debug_trace_transaction(call_tx_hash, noop_opts.clone())
         .await;
     let expected_noop_call_get_trace = serde_json::from_value::<FourByteFrame>(json![{}]).unwrap();
     // the response is deserialized into fourbytes from the rpc response
     // that is why we need to compare it with the FourByteTracer
     assert_eq!(
         noop_call_get_trace,
-        FourByteTracer(expected_noop_call_get_trace),
+        FourByteTracer(expected_noop_call_get_trace.clone()),
+    );
+
+    // Block traces return one empty frame per transaction, each with its hash, in block order
+    assert_eq!(send_eth_receipt.block_number, call_receipt.block_number);
+    let mut receipts = [&send_eth_receipt, &call_receipt];
+    receipts.sort_by_key(|receipt| receipt.transaction_index);
+    let expected_block_traces = receipts
+        .iter()
+        .map(|receipt| {
+            TraceResult::new_success(
+                FourByteTracer(expected_noop_call_get_trace.clone()),
+                Some(receipt.transaction_hash),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    // the first request traces the block and fills the cache, the second is served from it
+    let block_number = call_receipt.block_number.unwrap();
+    let traces_by_number = test_client
+        .debug_trace_block_by_number(BlockNumberOrTag::Number(block_number), noop_opts.clone())
+        .await;
+    assert_eq!(traces_by_number, expected_block_traces);
+
+    let traces_by_hash = test_client
+        .debug_trace_block_by_hash(call_receipt.block_hash.unwrap(), noop_opts)
+        .await;
+    assert_eq!(traces_by_hash, expected_block_traces);
+
+    task_manager.graceful_shutdown();
+
+    Ok(())
+}
+
+/// Tracing an endless loop of large calls must come back as an error rather than growing until the
+/// node runs out of memory.
+///
+/// Every `CALL` whose arguments come from memory makes revm copy those arguments into a fresh
+/// buffer, and the call tracer keeps a reference to that copy in the trace of the frame. A loop of
+/// calls with 1MB of arguments therefore retains a megabyte per iteration for the whole trace, even
+/// though the tracer records no opcode level steps at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_debug_trace_call_memory_limit() -> Result<(), Box<dyn std::error::Error>> {
+    let storage_dir = tempdir_with_children(&["DA", "sequencer"]);
+    let da_db_dir = storage_dir.path().join("DA").to_path_buf();
+    let sequencer_db_dir = storage_dir.path().join("sequencer").to_path_buf();
+
+    let (port_tx, port_rx) = tokio::sync::oneshot::channel();
+
+    let mut rollup_config = create_default_rollup_config(
+        true,
+        &sequencer_db_dir,
+        &da_db_dir,
+        NodeMode::SequencerNode,
+        None,
+    );
+    // the default is 512MB, a smaller budget makes the test abort after a handful of iterations
+    // instead of allocating half a gigabyte first
+    rollup_config.rpc.trace_memory_limit_mb = 32;
+    let sequencer_config = SequencerConfig::default();
+
+    let rollup_task = start_rollup(
+        port_tx,
+        GenesisPaths::from_dir(TEST_DATA_GENESIS_PATH),
+        None,
+        None,
+        rollup_config,
+        Some(sequencer_config),
+        None,
+        false,
+    )
+    .await;
+
+    let port = port_rx.await.unwrap();
+    let test_client = make_test_client(port).await?;
+
+    // 0x5b5f5f621000005f5f60015ff1505f56
+    // JUMPDEST; PUSH0 (retLength); PUSH0 (retOffset); PUSH3 0x100000 (argsLength, 1MB);
+    // PUSH0 (argsOffset); PUSH0 (value); PUSH1 0x01 (ecrecover); PUSH0 (gas); CALL; POP;
+    // PUSH0; JUMP - calls the precompile with a megabyte of arguments until the gas runs out
+    let init_code = Bytes::from_static(&[
+        0x5b, 0x5f, 0x5f, 0x62, 0x10, 0x00, 0x00, 0x5f, 0x5f, 0x60, 0x01, 0x5f, 0xf1, 0x50, 0x5f,
+        0x56,
+    ]);
+
+    let err = test_client
+        .debug_trace_call_result(
+            TransactionRequest {
+                // no `to`, so the init code above is what gets executed
+                to: None,
+                input: TransactionInput::new(init_code),
+                gas: Some(25_000_000),
+                ..Default::default()
+            },
+            Some(BlockId::Number(BlockNumberOrTag::Pending)),
+            Some(GethDebugTracingCallOptions::default().with_tracing_options(
+                GethDebugTracingOptions::default().with_tracer(GethDebugTracerType::BuiltInTracer(
+                    GethDebugBuiltInTracerType::CallTracer,
+                )),
+            )),
+        )
+        .await
+        .expect_err("tracing an endless loop of 1MB calls should exhaust the memory limit");
+
+    assert!(
+        err.to_string().contains("memory limit"),
+        "expected a memory limit error, got: {err}"
+    );
+
+    rollup_task.graceful_shutdown();
+
+    Ok(())
+}
+
+/// A prestate response that would retain more than `trace_memory_limit_mb` is rejected, for the
+/// prestate tracer and for a mux tracer that embeds it. The prestate frame is built from
+/// post-execution state after tracing finishes, so the per-step budget never sees it - the size
+/// bound while the frame is built is what keeps it in check.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_debug_trace_call_prestate_memory_limit() -> Result<(), Box<dyn std::error::Error>> {
+    let (task_manager, test_client, _) = init_sequencer_with_trace_memory_limit(1).await?;
+
+    // A contract whose code alone is 2 MiB, all STOP (0x00) so execution halts on the first byte.
+    // A prestate response must carry this code, so it exceeds the 1 MiB budget on its own.
+    let heavy = Address::from([0xcc; 20]);
+    let mut state_override = StateOverride::default();
+    state_override.insert(
+        heavy,
+        AccountOverride {
+            code: Some(Bytes::from(vec![0x00u8; 2 * 1024 * 1024])),
+            ..Default::default()
+        },
+    );
+
+    let request = TransactionRequest {
+        from: Some(test_client.from_addr),
+        to: Some(alloy_primitives::TxKind::Call(heavy)),
+        gas: Some(1_000_000),
+        ..Default::default()
+    };
+
+    // direct prestate tracer
+    let prestate_opts = GethDebugTracingCallOptions {
+        tracing_options: GethDebugTracingOptions::default().with_tracer(
+            GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::PreStateTracer),
+        ),
+        state_overrides: Some(state_override.clone()),
+        ..Default::default()
+    };
+    let err = test_client
+        .debug_trace_call_result(
+            request.clone(),
+            Some(BlockId::Number(BlockNumberOrTag::Pending)),
+            Some(prestate_opts),
+        )
+        .await
+        .expect_err("a 2 MiB prestate response must exceed a 1 MiB limit");
+    assert!(
+        err.to_string().contains("memory limit"),
+        "expected a memory limit error from the prestate tracer, got: {err}"
+    );
+
+    // mux tracer embedding the prestate tracer takes the same bound
+    let mut mux_opts = GethDebugTracingCallOptions {
+        state_overrides: Some(state_override),
+        ..Default::default()
+    };
+    mux_opts.tracing_options.tracer = Some(GethDebugTracerType::BuiltInTracer(
+        GethDebugBuiltInTracerType::MuxTracer,
+    ));
+    mux_opts.tracing_options.tracer_config = MuxConfig(HashMap::from_iter([(
+        GethDebugBuiltInTracerType::PreStateTracer,
+        Some(PreStateConfig::default().into()),
+    )]))
+    .into();
+    let err = test_client
+        .debug_trace_call_result(
+            request,
+            Some(BlockId::Number(BlockNumberOrTag::Pending)),
+            Some(mux_opts),
+        )
+        .await
+        .expect_err("a mux prestate response must exceed a 1 MiB limit");
+    assert!(
+        err.to_string().contains("memory limit"),
+        "expected a memory limit error from the mux tracer, got: {err}"
     );
 
     task_manager.graceful_shutdown();
+
+    Ok(())
+}
+
+/// With a single tracing permit, concurrent `debug_trace*` requests queue instead of running at
+/// once. That is what turns `trace_memory_limit_mb` into a bound on the node rather than on a
+/// single request: peak tracing memory is the per trace limit times the number of permits.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_tracing_requests_are_serialized_by_permits() -> Result<(), Box<dyn std::error::Error>>
+{
+    let storage_dir = tempdir_with_children(&["DA", "sequencer"]);
+    let da_db_dir = storage_dir.path().join("DA").to_path_buf();
+    let sequencer_db_dir = storage_dir.path().join("sequencer").to_path_buf();
+
+    let (port_tx, port_rx) = tokio::sync::oneshot::channel();
+
+    let mut rollup_config = create_default_rollup_config(
+        true,
+        &sequencer_db_dir,
+        &da_db_dir,
+        NodeMode::SequencerNode,
+        None,
+    );
+    // a single permit makes the serialization observable
+    rollup_config.rpc.max_tracing_requests = 1;
+    let sequencer_config = SequencerConfig::default();
+
+    let rollup_task = start_rollup(
+        port_tx,
+        GenesisPaths::from_dir(TEST_DATA_GENESIS_PATH),
+        None,
+        None,
+        rollup_config,
+        Some(sequencer_config),
+        None,
+        false,
+    )
+    .await;
+
+    let port = port_rx.await.unwrap();
+    let test_client = Arc::new(make_test_client(port).await?);
+
+    // a trace that takes a measurable amount of time: a loop that runs until it is out of gas
+    let request = TransactionRequest {
+        to: None,
+        input: TransactionInput::new(Bytes::from_static(&[0x5b, 0x60, 0x00, 0x56])),
+        gas: Some(5_000_000),
+        ..Default::default()
+    };
+    let opts = GethDebugTracingCallOptions::default().with_tracing_options(
+        GethDebugTracingOptions::default().with_tracer(GethDebugTracerType::BuiltInTracer(
+            GethDebugBuiltInTracerType::CallTracer,
+        )),
+    );
+
+    // time one trace on its own
+    let started = Instant::now();
+    test_client
+        .debug_trace_call_result(
+            request.clone(),
+            Some(BlockId::Number(BlockNumberOrTag::Pending)),
+            Some(opts.clone()),
+        )
+        .await?;
+    let single = started.elapsed();
+
+    // four at once cannot overlap through one permit, so the batch takes several times as long as
+    // one rather than about the same
+    let concurrent = 4;
+    let started = Instant::now();
+    let mut handles = Vec::new();
+    for _ in 0..concurrent {
+        let client = test_client.clone();
+        let request = request.clone();
+        let opts = opts.clone();
+        handles.push(tokio::spawn(async move {
+            client
+                .debug_trace_call_result(
+                    request,
+                    Some(BlockId::Number(BlockNumberOrTag::Pending)),
+                    Some(opts),
+                )
+                .await
+        }));
+    }
+    for handle in handles {
+        // queued requests are served, not rejected
+        handle
+            .await?
+            .expect("every queued trace should still be served");
+    }
+    let batch = started.elapsed();
+
+    assert!(
+        batch > single * 2,
+        "expected {concurrent} traces through one permit to serialize, but the batch took \
+         {batch:?} which is not meaningfully longer than the {single:?} one trace took"
+    );
+
+    rollup_task.graceful_shutdown();
 
     Ok(())
 }
@@ -1539,8 +2077,15 @@ async fn test_trace_chain_block_limit() -> Result<(), Box<dyn std::error::Error>
 
     let test_client = make_test_client(port).await?;
 
-    for _ in 0..15 {
+    // `citrea_testPublishBlock` returns before the block is committed, and under parallel test
+    // load a request does not always turn into a block, so publish until the head really is at 15.
+    // The handler checks that the end block exists before it checks the range, so asking for a
+    // block past the head would fail with "header not found" instead of the range error.
+    let mut attempts = 0;
+    while test_client.eth_block_number().await < 15 {
+        assert!(attempts < 30, "sequencer did not reach block 15");
         test_client.send_publish_batch_request().await;
+        attempts += 1;
     }
 
     let result = test_client
@@ -1552,10 +2097,107 @@ async fn test_trace_chain_block_limit() -> Result<(), Box<dyn std::error::Error>
         .await
         .expect_err("Expected error due to exceeding block limit");
 
-    assert!(result
-        .to_string()
-        .contains("Block range too large. Maximum allowed range is 10 blocks"));
+    let message = result.to_string();
+    assert!(
+        message.contains("Block range too large. Maximum allowed range is 10 blocks"),
+        "unexpected error: {message}"
+    );
     rollup_task.graceful_shutdown();
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_trace_sees_parent_block_hash() -> Result<(), Box<dyn std::error::Error>> {
+    let (task_manager, test_client, _) = init_sequencer().await?;
+
+    let contract = BlockHashContract::default();
+    let deploy_req = test_client
+        .deploy_contract(contract.byte_code(), None)
+        .await?;
+    test_client.send_publish_batch_request().await;
+    let contract_address = deploy_req.get_receipt().await?.contract_address.unwrap();
+
+    // The tx lands in head + 1 and reads blockhash(head), its parent
+    let head = test_client.eth_block_number().await;
+    let tx = test_client
+        .contract_transaction(contract_address, contract.get_block_hash(head), None)
+        .await;
+    test_client.send_publish_batch_request().await;
+    let receipt = tx.get_receipt().await?;
+    assert_eq!(receipt.block_number, Some(head + 1));
+
+    let parent_hash = test_client
+        .eth_get_block_by_number(Some(BlockNumberOrTag::Number(head)))
+        .await
+        .header
+        .hash;
+
+    let frame = test_client
+        .debug_trace_transaction(
+            receipt.transaction_hash,
+            Some(GethDebugTracingOptions::call_tracer(CallConfig::default())),
+        )
+        .await
+        .try_into_call_frame()
+        .unwrap();
+    assert_eq!(frame.output, Some(Bytes::from(parent_hash.0)));
+
+    task_manager.graceful_shutdown();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_trace_block_sees_parent_block_hash_after_ring_buffer_wraps(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (task_manager, test_client, _) = init_sequencer().await?;
+
+    let contract = BlockHashContract::default();
+    let deploy_req = test_client
+        .deploy_contract(contract.byte_code(), None)
+        .await?;
+    test_client.send_publish_batch_request().await;
+    let contract_address = deploy_req.get_receipt().await?.contract_address.unwrap();
+
+    // Past 256 blocks the parent's blockhash slot still holds the hash of the block 256 before it
+    for _ in test_client.eth_block_number().await..300 {
+        test_client.spam_publish_batch_request().await?;
+    }
+    wait_for_l2_block(&test_client, 300, None).await;
+
+    // The tx lands in head + 1 and reads blockhash(head), its parent
+    let head = test_client.eth_block_number().await;
+    let tx = test_client
+        .contract_transaction(contract_address, contract.get_block_hash(head), None)
+        .await;
+    test_client.send_publish_batch_request().await;
+    let receipt = tx.get_receipt().await?;
+    let block_number = receipt.block_number.unwrap();
+    assert_eq!(block_number, head + 1);
+
+    let parent_hash = test_client
+        .eth_get_block_by_number(Some(BlockNumberOrTag::Number(head)))
+        .await
+        .header
+        .hash;
+
+    let opts = Some(GethDebugTracingOptions::call_tracer(CallConfig::default()));
+    let tx_index = receipt.transaction_index.unwrap() as usize;
+    for traces in [
+        test_client
+            .debug_trace_block_by_number(BlockNumberOrTag::Number(block_number), opts.clone())
+            .await,
+        test_client
+            .debug_trace_block_by_hash(receipt.block_hash.unwrap(), opts.clone())
+            .await,
+    ] {
+        let TraceResult::Success { result, .. } = &traces[tx_index] else {
+            panic!("Unexpected trace result: {:?}", traces[tx_index]);
+        };
+        let frame = result.clone().try_into_call_frame().unwrap();
+        assert_eq!(frame.output, Some(Bytes::from(parent_hash.0)));
+    }
+
+    task_manager.graceful_shutdown();
     Ok(())
 }
