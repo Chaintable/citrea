@@ -1743,6 +1743,15 @@ impl<C: sov_modules_api::Context> Evm<C> {
         }
 
         set_state_to_end_of_evm_block::<C>(block_number - 1, working_set);
+        // This block's begin hook writes the parent hash into the ring buffer before any
+        // transaction runs, but the end-of-previous-block state does not have it. Without this,
+        // `BLOCKHASH(block.number - 1)` inside a replayed transaction returns the wrong value.
+        // Same fix as upstream's trace replay (CITRSC-875).
+        self.blockhash_set(
+            block_number - 1,
+            &block.header.parent_hash,
+            working_set,
+        );
 
         let citrea_spec_id = fork_fn(block_number).spec_id;
         let evm_spec_id = citrea_spec_id_to_evm_spec_id(citrea_spec_id);
